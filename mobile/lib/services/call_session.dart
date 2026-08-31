@@ -153,15 +153,22 @@ class CallSession {
 
     await socket.connect(id, token);
 
-    // تنفيذ أي Accept/Reject وصل من CallKit أثناء إغلاق التطبيق.
-    await processPendingCallKitAction();
-
-    // Keep an unhandled incoming call until HomeScreen has registered its
-    // broadcast listener and can consume it through takePendingIncomingCall.
-
-    // استقبال رسائل المكالمات يتم الآن بواسطة RtcCallManager.
+    // Telecom actions are restored explicitly by telecomBackgroundMain after
+    // the WebSocket is connected.
 
     return true;
+  }
+
+  /// Restores the authenticated WebSocket before a Telecom background action
+  /// emits any signalling. This is shared by accepted incoming and outgoing.
+  Future<void> ensureSocketReady() async {
+    final id = userId;
+    final token = accessToken;
+    if (id == null || id.isEmpty || token == null || token.isEmpty) {
+      throw StateError('No authenticated CN CALL session');
+    }
+    if (!socket.connected) await socket.connect(id, token);
+    if (!socket.connected) throw StateError('CN CALL WebSocket is not ready');
   }
 
   Future<void> incomingCallFromNotification(Map<String, dynamic> data) async {
@@ -182,57 +189,6 @@ class CallSession {
       _incomingCalls.add(data);
     } catch (e) {
       print('SAVE INCOMING CALL ERROR: $e');
-    }
-  }
-
-  Future<void> processPendingCallKitAction() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-
-      final action = prefs.getString('cn_call_pending_callkit_action');
-      final callerId = prefs.getString('cn_call_pending_callkit_caller_id');
-      final callId = prefs.getString('cn_call_pending_callkit_call_id');
-
-      if (action == null ||
-          action.isEmpty ||
-          callId == null ||
-          callId.isEmpty) {
-        return;
-      }
-
-      if (await isCallEnded(callId)) {
-        await clearPendingCallKitAction(callId);
-        await clearPendingIncomingCall(callId);
-        return;
-      }
-
-      if (callerId == null || callerId.isEmpty) {
-        await clearPendingCallKitAction(callId);
-        return;
-      }
-
-      if (action == 'accept') {
-        await RtcCallManager.instance.acceptCall(
-          callerId: callerId,
-          callId: callId,
-        );
-      } else if (action == 'reject') {
-        await RtcCallManager.instance.rejectCall(
-          callerId: callerId,
-          callId: callId,
-        );
-      } else {
-        // `incoming` is written by the native activity solely to accompany
-        // pending_incoming_call. It must not survive as a fake CallKit action.
-        await clearPendingCallKitAction(callId);
-        return;
-      }
-
-      // Delete the pending action only after the operation succeeds.
-      await clearPendingCallKitAction(callId);
-      await clearPendingIncomingCall(callId);
-    } catch (e) {
-      print('PROCESS PENDING CALLKIT ACTION ERROR: $e');
     }
   }
 
@@ -280,19 +236,6 @@ class CallSession {
       }
     } catch (_) {
       await prefs.remove('pending_incoming_call');
-    }
-  }
-
-  Future<void> clearPendingCallKitAction(String? callId) async {
-    if (callId == null || callId.isEmpty) return;
-
-    final prefs = await SharedPreferences.getInstance();
-    final pendingId = prefs.getString('cn_call_pending_callkit_call_id');
-    if (pendingId == callId) {
-      await prefs.remove('cn_call_pending_callkit_action');
-      await prefs.remove('cn_call_pending_callkit_caller_id');
-      await prefs.remove('cn_call_pending_callkit_call_id');
-      await prefs.remove('cn_call_pending_callkit_target_id');
     }
   }
 

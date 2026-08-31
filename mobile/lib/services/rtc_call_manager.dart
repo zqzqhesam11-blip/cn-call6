@@ -1,13 +1,13 @@
 // ignore_for_file: avoid_print
 
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async';
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/services.dart';
 
-import 'package:audioplayers/audioplayers.dart';
 import 'package:uuid/uuid.dart';
 
 import 'call_session.dart';
-import 'callkit_service.dart';
 import 'livekit_call.dart';
 import 'livekit_token_service.dart';
 
@@ -15,6 +15,7 @@ enum CallState {
   incoming,
   ringing,
   accepted,
+  negotiating,
   rejected,
   cancelled,
   connecting,
@@ -32,8 +33,6 @@ class RtcCallManager {
   final CallSession session = CallSession.instance;
   final LiveKitCall livekit = LiveKitCall();
 
-  final AudioPlayer _ringPlayer = AudioPlayer();
-  bool _ringing = false;
   Timer? _ringTimeoutTimer;
   Timer? _negotiationTimeoutTimer;
   Timer? _connectionTimeoutTimer;
@@ -57,14 +56,16 @@ class RtcCallManager {
 
   bool _started = false;
   bool _hangingUp = false;
+  Future<void>? _cleanupFuture;
+  final AudioPlayer _ringbackPlayer = AudioPlayer();
+  bool _ringbackPlaying = false;
   Completer<bool>? _callStartCompleter;
   int? _callStartExpiresAt;
 
-  Future<void> _startRinging({int? expiresAt}) async {
-    final wasRinging = _ringing;
-
-    _ringing = true;
-
+  Future<void> _startRinging({
+    required String callId,
+    int? expiresAt,
+  }) async {
     _ringTimeoutTimer?.cancel();
 
     Duration duration = const Duration(seconds: 90);
@@ -73,7 +74,7 @@ class RtcCallManager {
       final remainingMs = expiresAt - DateTime.now().millisecondsSinceEpoch;
 
       if (remainingMs <= 0) {
-        await _handleRingTimeout();
+        await _handleRingTimeout(callId);
         return;
       }
 
@@ -81,24 +82,28 @@ class RtcCallManager {
       duration = Duration(milliseconds: cappedMs);
     }
 
-    _ringTimeoutTimer = Timer(duration, _handleRingTimeout);
+    _ringTimeoutTimer = Timer(
+      duration,
+      () => _handleRingTimeout(callId),
+    );
 
     try {
-      if (!wasRinging) {
-        await _ringPlayer.stop();
-        await _ringPlayer.setReleaseMode(ReleaseMode.loop);
-        await _ringPlayer.play(
-          AssetSource('sounds/ringing.mp3'),
-          ctx: AudioContextConfig(route: AudioContextConfigRoute.earpiece)
-              .build(),
-        );
-        print('[CN CALL][RING] started');
-      }
+      await _ringbackPlayer.stop();
+      await _ringbackPlayer.setReleaseMode(ReleaseMode.loop);
+      await _ringbackPlayer.play(
+        AssetSource('sounds/ringing.mp3'),
+      );
+      _ringbackPlaying = true;
+
+      print(
+        '[CN CALL][RINGBACK START] call_id=$callId asset=sounds/ringing.mp3',
+      );
     } catch (e) {
-      _ringing = false;
-      _ringTimeoutTimer?.cancel();
-      _ringTimeoutTimer = null;
-      print('[CN CALL][RING] start error: $e');
+      _ringbackPlaying = false;
+
+      print(
+        '[CN CALL][RINGBACK FAILED] call_id=$callId error=$e',
+      );
     }
   }
 
@@ -106,15 +111,15 @@ class RtcCallManager {
     _ringTimeoutTimer?.cancel();
     _ringTimeoutTimer = null;
 
-    if (!_ringing) return;
+    if (_ringbackPlaying) {
+      try {
+        await _ringbackPlayer.stop();
+      } catch (e) {
+        print('[CN CALL][RINGBACK STOP FAILED] error=$e');
+      }
 
-    _ringing = false;
-
-    try {
-      await _ringPlayer.stop();
-      print('[CN CALL][RING] stopped');
-    } catch (e) {
-      print('[CN CALL][RING] stop error: $e');
+      _ringbackPlaying = false;
+      print('[CN CALL][RINGBACK STOP]');
     }
   }
 
@@ -173,8 +178,8 @@ class RtcCallManager {
     );
   }
 
-  Future<void> _handleRingTimeout() async {
-    if (!caller || inCall || currentCallId == null) return;
+  Future<void> _handleRingTimeout(String callId) async {
+    if (!_isCurrentCall(callId) || !caller || inCall) return;
 
     print('[CN CALL][RING] timeout reached');
 
@@ -213,12 +218,12 @@ class RtcCallManager {
           target.isNotEmpty &&
           session.loggedIn &&
           session.socket.connected) {
-        session.socket.send({
+        unawaited(session.socket.sendGuaranteed({
           'type': 'connected',
           'call_id': connectedCallId,
           'target_id': target,
           'from_id': session.userId,
-        });
+        }));
       }
 
       onConnected?.call();
@@ -227,10 +232,7 @@ class RtcCallManager {
     livekit.onDisconnected = () {
       if (_hangingUp) return;
 
-      print(
-        '[CN CALL][LIVEKIT MANAGER] disconnected '
-        'call_id=$currentCallId',
-      );
+      print('[CN CALL][LIVEKIT CONNECT FAILED] call_id=$currentCallId disconnected');
 
       unawaited(
         _cleanupCall(reason: 'failed', sendSignal: true, signalType: 'hangup'),
@@ -254,6 +256,8 @@ class RtcCallManager {
       state = CallState.incoming;
       remoteUserId = message['from_id']?.toString();
 
+      print('[CN CALL][CALL RECEIVE] call_id=$messageCallId from=$remoteUserId');
+
       onIncomingCall?.call(message);
       return;
     }
@@ -268,13 +272,14 @@ class RtcCallManager {
       // The server has already created the call and sent FCM.
       // Keep the caller ringing until the server-provided 90s expiry.
       state = CallState.ringing;
+      print('[CN CALL][CALL UI RINGING] call_id=$messageCallId');
 
       final expiresAtRaw = message['ring_expires_at'];
       _callStartExpiresAt = expiresAtRaw is int
           ? expiresAtRaw
           : int.tryParse(expiresAtRaw?.toString() ?? '');
 
-      await _startRinging(expiresAt: _callStartExpiresAt);
+      await _startRinging(callId: messageCallId!, expiresAt: _callStartExpiresAt);
 
       // call_started itself confirms that the server accepted the call.
       // target_online only tells us whether the target has a live WebSocket.
@@ -286,6 +291,7 @@ class RtcCallManager {
 
     if (type == 'call_accept') {
       if (!_isCurrentCall(messageCallId)) return;
+      print('[CN CALL][CALL ACCEPT FORWARD] call_id=$messageCallId');
       await _handleAccepted();
       return;
     }
@@ -317,7 +323,6 @@ class RtcCallManager {
 
     await session.markCallEnded(id);
     await session.clearPendingIncomingCall(id);
-    await session.clearPendingCallKitAction(id);
 
     try {
       const telecomChannel = MethodChannel('cn_call/call');
@@ -350,15 +355,22 @@ class RtcCallManager {
     return callId != null && callId.isNotEmpty && callId == currentCallId;
   }
 
-  Future<bool> startCall({required String targetId}) async {
+  Future<bool> startCall({
+    required String targetId,
+    String? callId,
+  }) async {
     final myId = session.userId;
     if (myId == null || targetId == myId) return false;
 
     if (currentCallId != null || inCall) return false;
 
     remoteUserId = targetId;
-    currentCallId = const Uuid().v4();
-    state = CallState.connecting;
+
+    final suppliedCallId = callId?.trim() ?? '';
+    currentCallId = suppliedCallId.isNotEmpty
+        ? suppliedCallId
+        : const Uuid().v4();
+    state = CallState.ringing;
     caller = true;
     inCall = false;
     remoteOnline = null;
@@ -366,8 +378,14 @@ class RtcCallManager {
     await session.markCallActive(currentCallId!);
     _pendingIceCandidates.clear();
 
+    try {
+      await session.ensureSocketReady();
+    } catch (error) {
+      await _cleanupCall(reason: 'failed');
+      return false;
+    }
     _callStartCompleter = Completer<bool>();
-    session.socket.send({
+    await session.socket.sendGuaranteed({
       'type': 'call',
       'call_id': currentCallId,
       'target_id': targetId,
@@ -375,14 +393,6 @@ class RtcCallManager {
       'from_id': myId,
     });
 
-    // The server accepts the call immediately. Open the caller screen
-    // without waiting for the target WebSocket/FCM path.
-    // target_online only describes whether the target has a live socket.
-    await CallKitService.instance.showOutgoingCall(
-      callId: currentCallId!,
-      targetId: targetId,
-      callerName: session.displayName ?? 'Hesam',
-    );
     return true;
   }
 
@@ -393,7 +403,13 @@ class RtcCallManager {
         (currentCallId != null && currentCallId != acceptedCallId)) {
       return;
     }
+    if (state == CallState.accepted ||
+        state == CallState.connecting ||
+        state == CallState.connected) {
+      return;
+    }
 
+    print('[CN CALL][CALL ANSWER RECEIVED] call_id=$acceptedCallId');
     remoteUserId = callerId;
     currentCallId = callId ?? currentCallId;
     await session.markCallActive(currentCallId!);
@@ -402,45 +418,44 @@ class RtcCallManager {
     inCall = false;
     _pendingIceCandidates.clear();
 
-    session.socket.send({
-      'type': 'call_accept',
-      'call_id': currentCallId,
-      'target_id': callerId,
-    });
-
     try {
-      unawaited(_connectLiveKit(currentCallId!));
+      // A cold Telecom action has to restore and await the same signalling
+      // socket used by outgoing calls. Never silently drop call_accept.
+      await session.ensureSocketReady();
+      if (!_isCurrentCall(acceptedCallId)) return;
+      print('[CN CALL][CALL SOCKET READY] call_id=$acceptedCallId');
+      await session.socket.sendGuaranteed({
+        'type': 'call_accept',
+        'call_id': acceptedCallId,
+        'target_id': callerId,
+      });
+      print('[CN CALL][CALL_ACCEPT SENT] call_id=$acceptedCallId');
+      state = CallState.negotiating;
+      _startNegotiationTimeout(acceptedCallId);
+      _startConnectionTimeout(acceptedCallId);
+      await _connectLiveKit(currentCallId!);
     } catch (e) {
-      print('[CN CALL][LIVEKIT] accept connect error: $e');
-    }
-
-    final activeCallId = currentCallId;
-    if (activeCallId != null) {
-      _startNegotiationTimeout(activeCallId);
-      _startConnectionTimeout(activeCallId);
-      state = CallState.connecting;
+      print('[CN CALL][LIVEKIT CONNECT FAILED] call_id=$acceptedCallId error=$e');
+      await _failTelecomAndCleanup(acceptedCallId, reason: 'failed');
     }
   }
 
   Future<void> _handleAccepted() async {
     if (!caller) return;
+    if (state == CallState.connecting || state == CallState.connected) return;
 
     await _stopRinging();
 
     final acceptedCallId = currentCallId;
     if (acceptedCallId == null || acceptedCallId.isEmpty) return;
 
-    state = CallState.connecting;
+    state = CallState.negotiating;
 
     try {
       await _connectLiveKit(acceptedCallId);
     } catch (e) {
-      print('[CN CALL][LIVEKIT] caller connect error: $e');
-      await _cleanupCall(
-        reason: 'failed',
-        sendSignal: true,
-        signalType: 'hangup',
-      );
+      print('[CN CALL][LIVEKIT CONNECT FAILED] call_id=$acceptedCallId error=$e');
+      await _failTelecomAndCleanup(acceptedCallId, reason: 'failed');
     }
   }
 
@@ -455,7 +470,7 @@ class RtcCallManager {
     if (currentCallId != null && currentCallId != rejectedCallId) return;
     if (remoteUserId != null && remoteUserId != rejectedCallerId) return;
 
-    // A CallKit action can launch Flutter after the process was terminated.
+    // A Telecom action can launch Flutter after the process was terminated.
     // Rehydrate only this exact call so cleanup sends its reject to the right
     // peer; a stale action can never clean up a newer call.
     currentCallId ??= rejectedCallId;
@@ -494,40 +509,71 @@ class RtcCallManager {
     bool sendSignal = false,
     String? signalType,
   }) async {
-    if (_hangingUp) return;
+    if (_hangingUp) return _cleanupFuture ?? Future<void>.value();
 
     _hangingUp = true;
     final callId = currentCallId;
     final target = remoteUserId;
 
-    try {
+    final cleanup = () async {
+      print('[CN CALL][CALL CLEANUP START] call_id=$callId reason=$reason');
+      try {
       _callStartCompleter?.complete(false);
       _callStartCompleter = null;
       _callStartExpiresAt = null;
       _cancelCallTimeouts();
       await _stopRinging();
 
-      if (sendSignal &&
-          callId != null &&
-          target != null &&
-          session.loggedIn &&
-          session.socket.connected) {
-        session.socket.send({
-          'type': signalType ?? 'hangup',
-          'call_id': callId,
-          'target_id': target,
-        });
+      if (sendSignal && callId != null && target != null && session.loggedIn) {
+        try {
+          // Terminal control messages must get a real ready handshake too;
+          // dropping them because a reconnect has just started leaves the
+          // other Samsung UI ringing until timeout.
+          await session.ensureSocketReady();
+          await session.socket.sendGuaranteed({
+            'type': signalType ?? 'hangup',
+            'call_id': callId,
+            'target_id': target,
+          });
+          print('[CN CALL][CALL TERMINAL] call_id=$callId type=${signalType ?? 'hangup'}');
+        } catch (error) {
+          print('[CN CALL][CALL TERMINAL SEND FAILED] call_id=$callId error=$error');
+        }
       }
 
       await livekit.disconnect();
 
       if (callId != null && callId.isNotEmpty) {
-        await CallKitService.instance.forceEndCall(callId);
+        try {
+          const telecomChannel = MethodChannel('cn_call/call');
+          await telecomChannel.invokeMethod('disconnectTelecomCall', {'callId': callId});
+        } catch (error) {
+          print('[CN CALL][TELECOM] local disconnect failed: $error');
+        }
+      }
+
+      if (callId != null && callId.isNotEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+
+        await prefs.setString(
+          'cn_call_telecom_ended_call_id',
+          callId,
+        );
+
+        final activeId = prefs.getString(
+          'cn_call_telecom_active_call_id',
+        );
+
+        if (activeId == callId) {
+          await prefs.remove(
+            'cn_call_telecom_active_call_id',
+          );
+        }
+
       }
 
       await session.markCallEnded(callId);
       await session.clearPendingIncomingCall(callId);
-      await session.clearPendingCallKitAction(callId);
 
       _pendingIceCandidates.clear();
       remoteUserId = null;
@@ -544,9 +590,14 @@ class RtcCallManager {
       };
 
       if (callId != null) onDisconnected?.call();
-    } finally {
-      _hangingUp = false;
-    }
+      print('[CN CALL][CALL CLEANUP DONE] call_id=$callId reason=$reason');
+      } finally {
+        _hangingUp = false;
+        _cleanupFuture = null;
+      }
+    }();
+    _cleanupFuture = cleanup;
+    return cleanup;
   }
 
   Future<void> mute(bool value) {
@@ -564,14 +615,10 @@ class RtcCallManager {
     _started = false;
 
     await livekit.disconnect();
-    await _ringPlayer.dispose();
   }
 
   Future<void> _connectLiveKit(String callId) async {
-    print(
-      '[CN CALL][LIVEKIT MANAGER] requesting token '
-      'call_id=$callId',
-    );
+    print('[CN CALL][LIVEKIT START] call_id=$callId');
 
     final data = await LiveKitTokenService.getToken(callId: callId);
 
@@ -587,5 +634,58 @@ class RtcCallManager {
     }
 
     await livekit.connect(url: url, token: token);
+    print('[CN CALL][LIVEKIT CONNECTED] call_id=$callId');
+
+    if (!_isCurrentCall(callId)) {
+      await livekit.disconnect();
+      throw StateError('LiveKit connected for a stale call');
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+
+    await prefs.setString(
+      'cn_call_telecom_active_call_id',
+      callId,
+    );
+
+    await prefs.remove(
+      'cn_call_telecom_ended_call_id',
+    );
+
+    print(
+      '[CN CALL][TELECOM] LiveKit connected call_id=$callId',
+    );
+    try {
+      const telecomChannel = MethodChannel('cn_call/call');
+      final activated = await telecomChannel.invokeMethod<bool>(
+            'activateTelecomCall',
+            {'callId': callId},
+          ) ??
+          false;
+      if (!activated) throw StateError('Telecom connection is unavailable');
+      livekit.notifyConnected();
+      print('[CN CALL][TELECOM ACTIVE] call_id=$callId');
+    } catch (_) {
+      rethrow;
+    }
+  }
+
+  Future<void> endFromTelecom({required String callId, required String reason}) async {
+    if (!_isCurrentCall(callId)) {
+      await session.markCallEnded(callId);
+      await session.clearPendingIncomingCall(callId);
+      return;
+    }
+    await _cleanupCall(reason: reason);
+  }
+
+  Future<void> _failTelecomAndCleanup(String callId, {required String reason}) async {
+    try {
+      const telecomChannel = MethodChannel('cn_call/call');
+      await telecomChannel.invokeMethod('failTelecomCall', {'callId': callId});
+    } catch (error) {
+      print('[CN CALL][TELECOM] failure disconnect failed: $error');
+    }
+    await _cleanupCall(reason: reason, sendSignal: true, signalType: 'hangup');
   }
 }

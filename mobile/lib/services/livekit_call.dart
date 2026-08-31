@@ -14,6 +14,10 @@ class LiveKitCall {
     required String url,
     required String token,
   }) async {
+    // Keep LiveKit's normal audio-session handling.  This is a managed
+    // Telecom call, but externalCallSystem is not a substitute for verifying
+    // that capture/publication actually succeeded.
+
     _room = Room(
       roomOptions: const RoomOptions(
         adaptiveStream: false,
@@ -24,7 +28,6 @@ class LiveKitCall {
     _room!.events.listen((event) async {
       if (event is RoomConnectedEvent) {
         print('[CN CALL][LIVEKIT] CONNECTED');
-        onConnected?.call();
       }
 
       if (event is RoomDisconnectedEvent) {
@@ -45,24 +48,21 @@ class LiveKitCall {
       }
     });
 
+    print('[CN CALL][LIVEKIT CONNECT START]');
+
     await _room!.connect(url, token);
 
-    // Default audio route: phone earpiece, not speakerphone.
-    await AudioManager.instance.setSpeakerOutputPreferred(false);
+    print('[CN CALL][LIVEKIT CONNECTED] localParticipant=${_room!.localParticipant != null}');
 
-    await _room!.localParticipant?.setMicrophoneEnabled(true);
+    await _enableAndVerifyMicrophone();
   }
 
+  /// Called only after Telecom has accepted the already-verified media call.
+  void notifyConnected() => onConnected?.call();
+
   Future<void> setSpeaker(bool value) async {
-    final room = _room;
-    if (room == null) return;
-
-    await AudioManager.instance.setSpeakerOutputPreferred(value);
-
-    print(
-      '[CN CALL][LIVEKIT] speaker '
-      '${value ? 'on' : 'off'}',
-    );
+    // Device routing belongs to Telecom/InCallUI for managed calls.
+    print('[CN CALL][LIVEKIT] ignored speaker request; Telecom owns routing');
   }
 
   Future<void> mute(bool value) async {
@@ -83,5 +83,33 @@ class LiveKitCall {
     _room = null;
 
     print('[CN CALL][LIVEKIT] DISCONNECTED');
+  }
+
+  Future<void> _enableAndVerifyMicrophone() async {
+    final participant = _room?.localParticipant;
+    if (participant == null) {
+      throw StateError('LiveKit local participant is unavailable');
+    }
+    print('[CN CALL][LOCAL PARTICIPANT READY]');
+    // Cold-started calls can connect before WebRTC has activated capture. A
+    // second enable after one event-loop turn turns this into an explicit
+    // publication check instead of assuming Telecom mute is the cause.
+    for (var attempt = 0; attempt < 2; attempt++) {
+      print('[CN CALL][MIC ENABLE START] attempt=${attempt + 1}');
+      await participant.setMicrophoneEnabled(true);
+      final hasLiveAudio = participant.trackPublications.values.any(
+        (publication) =>
+            publication.kind == TrackType.AUDIO && !publication.muted,
+      );
+      if (hasLiveAudio) {
+        print('[CN CALL][MIC ENABLE RESULT] enabled=true');
+        print('[CN CALL][LOCAL AUDIO PUBLISHED]');
+        return;
+      }
+      print('[CN CALL][MIC ENABLE RESULT] enabled=false');
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    }
+    print('[CN CALL][LIVEKIT CONNECT FAILED] microphone_not_published');
+    throw StateError('LiveKit did not publish an unmuted local audio track; check RECORD_AUDIO permission');
   }
 }

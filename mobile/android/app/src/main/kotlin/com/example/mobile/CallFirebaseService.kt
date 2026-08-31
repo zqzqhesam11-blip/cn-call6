@@ -1,13 +1,9 @@
 package com.example.mobile
 
-import android.content.Intent
-import android.os.Bundle
 import org.json.JSONArray
 import org.json.JSONObject
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
-import com.hiennv.flutter_callkit_incoming.CallkitIncomingBroadcastReceiver
-import com.hiennv.flutter_callkit_incoming.CallkitConstants
 
 class CallFirebaseService : FirebaseMessagingService() {
 
@@ -15,7 +11,7 @@ class CallFirebaseService : FirebaseMessagingService() {
 
         val type = message.data["type"]
 
-            if (type == "call_cancelled" || type == "hangup") {
+            if (type == "call_cancelled" || type == "call_reject" || type == "hangup" || type == "timeout" || type == "disconnected") {
                 val callId = message.data["call_id"] ?: return
 
                 CallConnectionService.disconnectCall(callId)
@@ -47,192 +43,41 @@ class CallFirebaseService : FirebaseMessagingService() {
             return
         }
 
-        val callId =
-            message.data["call_id"] ?: return
-        val targetId = message.data["target_id"] ?: ""
-
+        val callId = message.data["call_id"]?.trim().orEmpty()
+        if (callId.isEmpty()) return
         if (isCallEnded(callId)) {
             println("CN CALL: ignored stale incoming FCM. callId=$callId")
             return
         }
 
-        saveCallState(
-            callId = callId,
-            callerId = callerId,
-            callerName = callerName,
-            targetId = targetId,
-            state = "incoming"
-        )
-
-        val data = Bundle().apply {
-
-            putString(
-                CallkitConstants.EXTRA_CALLKIT_ID,
-                callId
-            )
-
-            putString(
-                CallkitConstants.EXTRA_CALLKIT_NAME_CALLER,
-                callerName
-            )
-
-            putString(
-                CallkitConstants.EXTRA_CALLKIT_APP_NAME,
-                "CN CALL"
-            )
-
-            putString(
-                CallkitConstants.EXTRA_CALLKIT_HANDLE,
-                callerId
-            )
-
-            putString(
-                CallkitConstants.EXTRA_CALLKIT_AVATAR,
-                ""
-            )
-
-            putInt(
-                CallkitConstants.EXTRA_CALLKIT_TYPE,
-                0
-            )
-
-            putLong(
-                CallkitConstants.EXTRA_CALLKIT_DURATION,
-                30000L
-            )
-
-            putString(
-                CallkitConstants.EXTRA_CALLKIT_TEXT_ACCEPT,
-                "قبول"
-            )
-
-            putString(
-                CallkitConstants.EXTRA_CALLKIT_TEXT_DECLINE,
-                "رفض"
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_IS_SHOW_FULL_LOCKED_SCREEN,
-                true
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_IS_IMPORTANT,
-                true
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_IS_FULL_SCREEN,
-                true
-            )
-
-            putString(
-                CallkitConstants.EXTRA_CALLKIT_ACTION_FROM,
-                "notification"
-            )
-
-            putSerializable(
-                CallkitConstants.EXTRA_CALLKIT_EXTRA,
-                hashMapOf(
-                    "callId" to callId,
-                    "callerId" to callerId,
-                    "callerName" to callerName,
-                    "targetId" to targetId
-                )
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_MISSED_CALL_SHOW,
-                true
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_MISSED_CALL_CALLBACK_SHOW,
-                true
-            )
-
-            putInt(
-                CallkitConstants.EXTRA_CALLKIT_MISSED_CALL_COUNT,
-                1
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_CALLING_SHOW,
-                false
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_IS_CUSTOM_NOTIFICATION,
-                false
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_IS_SHOW_LOGO,
-                false
-            )
-
-            putBoolean(
-                CallkitConstants.EXTRA_CALLKIT_IS_SHOW_CALL_ID,
-                false
-            )
-        }
-
-        // Try Android Telecom directly. For a managed PhoneAccount,
-        // addNewIncomingCall() will reject an unregistered or disabled
-        // account; in that case we keep CallKit as the fallback.
+        // System-managed ConnectionService is the only incoming-call path.
         try {
-            TelecomHelper.addIncomingCall(
+            val submitted = TelecomHelper.addIncomingCall(
                 context = this,
                 callerId = callerId,
                 callerName = callerName,
                 callId = callId,
             )
 
-            println(
-                "CN CALL: Android Telecom incoming call added. " +
-                    "callerId=$callerId callerName=$callerName"
-            )
+            if (submitted) {
+                // Keep native FCM and Flutter on the same per-call guard. This
+                // prevents a second incoming call from replacing the Samsung
+                // InCallUI call while Flutter is terminated.
+                getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+                    .edit()
+                    .putString("flutter.cn_call_active_call_id", callId)
+                    .putLong("flutter.cn_call_active_call_at", System.currentTimeMillis())
+                    .apply()
+            }
+
+            println("[CN CALL][CALL UI RINGING] submitted=$submitted call_id=$callId callerId=$callerId")
             return
-        } catch (e: SecurityException) {
-            println(
-                "CN CALL: Telecom PhoneAccount unavailable or disabled; " +
-                    "using CallKit fallback. error=$e"
-            )
         } catch (e: Exception) {
             println(
-                "CN CALL: Telecom incoming call failed; using CallKit fallback. " +
+                "CN CALL Telecom: incoming call failed. " +
                     "error=$e"
             )
         }
-
-        println(
-            "CN CALL: Telecom did not accept incoming call; " +
-                "CallKit incoming UI is disabled."
-        )
-    }
-
-    private fun saveCallState(
-        callId: String,
-        callerId: String,
-        callerName: String,
-        targetId: String,
-        state: String
-    ) {
-        val stateJson = JSONObject().apply {
-            put("call_id", callId)
-            put("caller_id", callerId)
-            put("caller_name", callerName)
-            put("target_id", targetId)
-            put("state", state)
-            put("accepted", false)
-            put("rejected", false)
-            put("cancelled", false)
-        }
-
-        getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
-            .edit()
-            .putString("flutter.pending_incoming_call", stateJson.toString())
-            .apply()
     }
 
     private fun isCallEnded(callId: String): Boolean {
@@ -262,11 +107,9 @@ class CallFirebaseService : FirebaseMessagingService() {
         if (pendingId == callId) {
             editor.remove("flutter.pending_incoming_call")
         }
-        if (prefs.getString("flutter.cn_call_pending_callkit_call_id", null) == callId) {
-            editor.remove("flutter.cn_call_pending_callkit_action")
-                .remove("flutter.cn_call_pending_callkit_caller_id")
-                .remove("flutter.cn_call_pending_callkit_call_id")
-                .remove("flutter.cn_call_pending_callkit_target_id")
+        if (prefs.getString("flutter.cn_call_active_call_id", null) == callId) {
+            editor.remove("flutter.cn_call_active_call_id")
+            editor.remove("flutter.cn_call_active_call_at")
         }
         editor.apply()
     }

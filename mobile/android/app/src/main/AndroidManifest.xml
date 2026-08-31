@@ -2,12 +2,17 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.CALL_PHONE"/>
+    <!-- TelecomManager.getPhoneAccount() is guarded by this runtime permission
+         on the affected Android/Samsung builds. -->
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.VIBRATE"/>
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL"/>
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS"/>
 
     <application
         android:label="mobile"
@@ -49,7 +54,7 @@
         <service
             android:name=".CallForegroundService"
             android:exported="false"
-            android:foregroundServiceType="microphone" />
+            android:foregroundServiceType="phoneCall" />
 
         <service
             android:name=".CallConnectionService"
@@ -63,8 +68,6 @@
         <receiver
             android:name=".TelecomCallActionReceiver"
             android:exported="false" />
-
-
 
         <meta-data
             android:name="flutterEmbedding"

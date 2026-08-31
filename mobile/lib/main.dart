@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,11 +15,56 @@ import 'services/call_session.dart';
 import 'services/firebase_messaging_service.dart';
 import 'services/account_api.dart';
 import 'services/rtc_call_manager.dart';
-import 'services/callkit_service.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
 const MethodChannel _telecomChannel = MethodChannel('cn_call/call');
+const MethodChannel _telecomEventsChannel =
+    MethodChannel('cn_call/telecom_events');
+
+Future<void> _handleTelecomAction(Map<Object?, Object?> arguments) async {
+  final action = arguments['action']?.toString() ?? '';
+  final callId = arguments['callId']?.toString() ?? '';
+  final peerId = arguments['peerId']?.toString() ?? '';
+  if (callId.isEmpty || peerId.isEmpty) return;
+  print('[CN CALL][CALL ACTION RECEIVED] action=$action call_id=$callId');
+  if (action == 'accept') {
+    await RtcCallManager.instance.acceptCall(callerId: peerId, callId: callId);
+  } else if (action == 'outgoing') {
+    await RtcCallManager.instance.startCall(targetId: peerId, callId: callId);
+  } else if (action == 'reject') {
+    await RtcCallManager.instance.rejectCall(callerId: peerId, callId: callId);
+  } else if (action == 'ended') {
+    await RtcCallManager.instance.endFromTelecom(callId: callId, reason: 'ended');
+  }
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString('flutter.cn_call_telecom_actions_v1') ?? '[]';
+  try {
+    final queued = jsonDecode(raw);
+    if (queued is List) {
+      queued.removeWhere((item) => item is Map &&
+          item['action']?.toString() == action &&
+          item['callId']?.toString() == callId);
+      await prefs.setString('flutter.cn_call_telecom_actions_v1', jsonEncode(queued));
+    }
+  } catch (_) {
+    // The cold-start drain will discard a malformed queue safely.
+  }
+}
+
+void _installTelecomEventHandler() {
+  _telecomEventsChannel.setMethodCallHandler((call) async {
+    final arguments = Map<Object?, Object?>.from(call.arguments as Map);
+    if (call.method == 'muteChanged') {
+      final callId = arguments['callId']?.toString() ?? '';
+      if (callId.isNotEmpty && RtcCallManager.instance.currentCallId == callId) {
+        await RtcCallManager.instance.mute(arguments['isMuted'] == true);
+      }
+      return;
+    }
+    if (call.method == 'callAction') await _handleTelecomAction(arguments);
+  });
+}
 
 Future<void> openTelecomSettings() async {
   try {
@@ -34,6 +80,8 @@ Future<void> openTelecomSettings() async {
 Future<void> telecomBackgroundMain() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  _installTelecomEventHandler();
+
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
@@ -48,7 +96,71 @@ Future<void> telecomBackgroundMain() async {
       return;
     }
 
-    await CallSession.instance.processPendingCallKitAction();
+    final prefs = await SharedPreferences.getInstance();
+    final queued = prefs.getString('flutter.cn_call_telecom_actions_v1') ?? '[]';
+    final actions = <Map<String, dynamic>>[];
+    try {
+      final decoded = jsonDecode(queued);
+      if (decoded is List) {
+        for (final item in decoded) {
+          if (item is Map) actions.add(Map<String, dynamic>.from(item));
+        }
+      }
+    } catch (_) {
+      print('[CN CALL][TELECOM] invalid persisted action queue');
+    }
+
+    for (final actionData in actions) {
+      final telecomAction = actionData['action']?.toString() ?? '';
+      final telecomCallId = actionData['callId']?.toString() ?? '';
+      final telecomPeerId = actionData['peerId']?.toString() ?? '';
+      if (telecomCallId.isEmpty || telecomPeerId.isEmpty) continue;
+      print('[CN CALL][TELECOM ACTION DEQUEUED] action=$telecomAction call_id=$telecomCallId');
+      if (telecomAction == 'accept') {
+      print(
+        '[CN CALL][TELECOM] background ACCEPT '
+        'call_id=$telecomCallId peer_id=$telecomPeerId',
+      );
+
+      await RtcCallManager.instance.acceptCall(
+        callerId: telecomPeerId,
+        callId: telecomCallId,
+      );
+
+      print(
+        '[CN CALL][TELECOM] background ACCEPT processed '
+        'call_id=$telecomCallId',
+      );
+
+      final mutedCallId =
+          prefs.getString('flutter.cn_call_telecom_mute_call_id') ?? '';
+      if (mutedCallId == telecomCallId) {
+        await RtcCallManager.instance.mute(
+          prefs.getBool('flutter.cn_call_telecom_is_muted') ?? false,
+        );
+      }
+      } else if (telecomAction == 'outgoing') {
+      await RtcCallManager.instance.startCall(
+        targetId: telecomPeerId,
+        callId: telecomCallId,
+      );
+      } else if (telecomAction == 'reject') {
+      await RtcCallManager.instance.rejectCall(
+        callerId: telecomPeerId,
+        callId: telecomCallId,
+      );
+      } else if (telecomAction == 'ended') {
+      await RtcCallManager.instance.endFromTelecom(
+        callId: telecomCallId,
+        reason: 'ended',
+      );
+      }
+    }
+
+    // Actions are removed only after restore, socket readiness and the Dart
+    // lifecycle handler have run.  Duplicate delivery is harmless because
+    // RtcCallManager gates every action by call_id/state.
+    await prefs.remove('flutter.cn_call_telecom_actions_v1');
 
     print(
       '[CN CALL][TELECOM] background call action processed',
@@ -69,7 +181,7 @@ Future<void> main() async {
 
   await FirebaseMessagingService.instance.initialize();
 
-  await CallKitService.instance.initialize();
+  _installTelecomEventHandler();
 
   RtcCallManager.instance.startListening();
 
@@ -417,17 +529,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final rtcManager = RtcCallManager.instance;
     rtcManager.startListening();
 
-    // لا نفتح CallScreen بعد قبول CallKit.
-    // شاشة المكالمة تبقى مستقلة عن التطبيق.
-
-    CallKitService.instance.onAccepted = (callerId) {
-      _incomingCallScreenOpen = false;
-      _incomingCallScreenCallId = null;
-
-      // لا نفتح التطبيق عند الرد من CallKit.
-      // تبقى واجهة المكالمة الأصلية للنظام ظاهرة.
-    };
-
     Future<void> showIncomingCall(Map<String, dynamic> call) async {
       if (!mounted) return;
 
@@ -514,9 +615,6 @@ class _HomeScreenState extends State<HomeScreen> {
       _closeIncomingCallScreen();
     };
 
-    CallKitService.instance.onRejected = (_) {
-      _closeIncomingCallScreen();
-    };
   }
 
   Future<void> _loadLocalData() async {
@@ -742,21 +840,25 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    final manager = RtcCallManager.instance;
-    if (manager.currentCallId != null || manager.inCall) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('لديك مكالمة نشطة بالفعل')),
-      );
-      return;
-    }
-
     final name = 'المستخدم $id';
 
     await _addHistory(name: name, id: id, incoming: false);
 
-    manager.startListening();
+    if (kIsWeb) {
+      final started = await RtcCallManager.instance.startCall(targetId: id);
+      if (!started || !mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => CallScreen(name: name, id: id)),
+      );
+      return;
+    }
 
-    final started = await manager.startCall(targetId: id);
+    final started = await _telecomChannel.invokeMethod<bool>(
+          'placeOutgoingTelecomCall',
+          <String, dynamic>{'targetId': id},
+        ) ??
+        false;
     if (!started) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -765,14 +867,6 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    if (!mounted) return;
-
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => CallScreen(name: name, id: id),
-      ),
-    );
   }
 
   @override

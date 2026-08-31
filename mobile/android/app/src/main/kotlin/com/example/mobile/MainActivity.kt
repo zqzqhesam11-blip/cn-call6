@@ -1,191 +1,159 @@
 package com.example.mobile
 
-import android.os.Bundle
 import android.content.Intent
-import android.provider.Settings
-import org.json.JSONArray
-import org.json.JSONObject
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Bundle
+import android.os.Build
+import android.telecom.TelecomManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
-
-    private val CHANNEL = "cn_call/call"
+    private val channel = "cn_call/call"
+    private val readPhoneNumbersRequestCode = 9000
+    private val callPhoneRequestCode = 9001
+    private var pendingOutgoingTarget: String? = null
+    private var pendingOutgoingResult: MethodChannel.Result? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
+        // Registration does not enable a managed account; the user does that
+        // in Phone accounts settings before Telecom can bind this service.
         TelecomHelper.register(this)
-
-        persistCallKitIntent(intent)
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        persistCallKitIntent(intent)
-    }
-
-    private fun persistCallKitIntent(intent: Intent?) {
-        val data = intent?.getBundleExtra("EXTRA_CALLKIT_CALL_DATA") ?: return
-        val extra = data.getSerializable("EXTRA_CALLKIT_EXTRA") as? HashMap<*, *>
-        val callId = data.getString("EXTRA_CALLKIT_ID")
-            ?: extra?.get("callId")?.toString()
-            ?: return
-        val callerId = data.getString("EXTRA_CALLKIT_HANDLE")
-            ?: extra?.get("callerId")?.toString()
-            ?: ""
-        val callerName = data.getString("EXTRA_CALLKIT_NAME_CALLER")
-            ?: extra?.get("callerName")?.toString()
-            ?: "CN CALL"
-        val targetId = extra?.get("targetId")?.toString() ?: ""
-        val action = when {
-            intent.action?.endsWith("ACTION_CALL_ACCEPT") == true -> "accept"
-            intent.action?.endsWith("ACTION_CALL_DECLINE") == true -> "reject"
-            intent.action?.endsWith("ACTION_CALL_ENDED") == true -> "ended"
-            else -> "incoming"
-        }
-
-        if (action == "ended") {
-            markCallEnded(callId)
-            return
-        }
-        if (isCallEnded(callId)) return
-
-        val stateJson = JSONObject().apply {
-            put("call_id", callId)
-            put("caller_id", callerId)
-            put("caller_name", callerName)
-            put("target_id", targetId)
-            put("state", action)
-            put("accepted", action == "accept")
-            put("rejected", action == "reject")
-            put("cancelled", false)
-        }
-
-        getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
-            .edit()
-            .putString("flutter.cn_call_pending_callkit_action", action)
-            .putString("flutter.cn_call_pending_callkit_call_id", callId)
-            .putString("flutter.cn_call_pending_callkit_caller_id", callerId)
-            .putString("flutter.pending_incoming_call", stateJson.toString())
-            .apply()
-    }
-
-    private fun markCallEnded(callId: String) {
-        val prefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
-        val endedIds = endedCallIds(prefs).toMutableList()
-        endedIds.remove(callId)
-        endedIds.add(callId)
-        if (endedIds.size > 32) {
-            endedIds.subList(0, endedIds.size - 32).clear()
-        }
-
-        val editor = prefs.edit().putString(
-            "flutter.cn_call_ended_call_ids_v2",
-            JSONArray(endedIds).toString()
-        )
-        val pending = prefs.getString("flutter.pending_incoming_call", null)
-        val pendingId = try {
-            JSONObject(pending ?: "{}").optString("call_id")
-        } catch (_: Exception) {
-            ""
-        }
-        if (pendingId == callId) {
-            editor.remove("flutter.pending_incoming_call")
-        }
-        if (prefs.getString("flutter.cn_call_pending_callkit_call_id", null) == callId) {
-            editor.remove("flutter.cn_call_pending_callkit_action")
-                .remove("flutter.cn_call_pending_callkit_caller_id")
-                .remove("flutter.cn_call_pending_callkit_call_id")
-                .remove("flutter.cn_call_pending_callkit_target_id")
-        }
-        editor.apply()
-    }
-
-    private fun isCallEnded(callId: String): Boolean {
-        return endedCallIds(
-            getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
-        ).contains(callId)
-    }
-
-    private fun endedCallIds(prefs: android.content.SharedPreferences): List<String> {
-        val encoded = prefs.getString("flutter.cn_call_ended_call_ids_v2", "[]")
-        return try {
-            val values = JSONArray(encoded ?: "[]")
-            List(values.length()) { index -> values.optString(index).trim() }
-                .filter { it.isNotEmpty() }
-        } catch (_: Exception) {
-            emptyList()
-        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-
-        MethodChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
-            CHANNEL
-        ).setMethodCallHandler { call, result ->
-
-            when (call.method) {
-                "showIncomingCall" -> {
-                    result.success(true)
-                }
-
-                "openTelecomSettings" -> {
-                    startActivity(
-                        Intent(android.telecom.TelecomManager.ACTION_CHANGE_PHONE_ACCOUNTS)
-                    )
-                    result.success(true)
-                }
-
-                "disconnectTelecomCall" -> {
-                    val callId = call.argument<String>("callId").orEmpty()
-
-                    if (callId.isEmpty()) {
-                        result.success(false)
-                    } else {
-                        CallConnectionService.disconnectCall(callId)
+        // Telecom actions must target this already-running Flutter isolate.
+        // Without this cache entry the receiver starts a second isolate, which
+        // logs in again and creates a competing WebSocket for the same user.
+        FlutterEngineCache.getInstance().put("cn_call_telecom_background_engine", flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channel)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "openTelecomSettings" -> {
+                        startActivity(Intent(TelecomManager.ACTION_CHANGE_PHONE_ACCOUNTS))
                         result.success(true)
                     }
-                }
-
-                "addIncomingTelecomCall" -> {
-                    val callerId = call.argument<String>("callerId").orEmpty()
-                    val callerName = call.argument<String>("callerName").orEmpty()
-                    val callId = call.argument<String>("callId").orEmpty()
-
-                    if (callerId.isEmpty() || callId.isEmpty()) {
-                        result.success(false)
-                    } else {
-                        try {
-                            TelecomHelper.addIncomingCall(
-                                context = this,
-                                callerId = callerId,
-                                callerName = callerName.ifEmpty { "CN CALL" },
-                                callId = callId,
-                            )
-                            result.success(true)
-                        } catch (e: SecurityException) {
-                            println(
-                                "CN CALL Telecom: incoming call rejected: $e"
-                            )
+                    "isTelecomAccountEnabled" -> result.success(TelecomHelper.isEnabled(this))
+                    "addIncomingTelecomCall" -> {
+                        val callId = call.argument<String>("callId").orEmpty().trim()
+                        val callerId = call.argument<String>("callerId").orEmpty().trim()
+                        val callerName = call.argument<String>("callerName").orEmpty().trim()
+                        result.success(
+                            try {
+                                TelecomHelper.addIncomingCall(
+                                    this, callerId, callerName.ifEmpty { "CN CALL" }, callId
+                                )
+                            } catch (error: SecurityException) {
+                                println("CN CALL Telecom: managed account is unavailable: $error")
+                                false
+                            }
+                        )
+                    }
+                    "placeOutgoingTelecomCall" -> {
+                        val targetId = call.argument<String>("targetId").orEmpty().trim()
+                        if (targetId.isEmpty()) {
                             result.success(false)
-                        } catch (e: Exception) {
-                            println(
-                                "CN CALL Telecom: incoming call failed: $e"
-                            )
-                            result.success(false)
+                        } else if (hasPhoneAccountPermission() && hasCallPhonePermission()) {
+                            result.success(placeOutgoingTelecomCall(targetId))
+                        } else {
+                            pendingOutgoingTarget = targetId
+                            pendingOutgoingResult = result
+                            requestPhoneNumbersPermissionOrFail()
                         }
                     }
-                }
-
-                else -> {
-                    result.notImplemented()
+                    "disconnectTelecomCall" -> {
+                        val callId = call.argument<String>("callId").orEmpty().trim()
+                        if (callId.isEmpty()) result.success(false)
+                        else {
+                            CallConnectionService.disconnectCall(callId, notifyFlutter = false)
+                            result.success(true)
+                        }
+                    }
+                    "activateTelecomCall" -> {
+                        result.success(CallConnectionService.activateCall(
+                            call.argument<String>("callId").orEmpty().trim()
+                        ))
+                    }
+                    "failTelecomCall" -> {
+                        result.success(CallConnectionService.failCall(
+                            call.argument<String>("callId").orEmpty().trim()
+                        ))
+                    }
+                    else -> result.notImplemented()
                 }
             }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == readPhoneNumbersRequestCode) {
+            if (hasPhoneAccountPermission()) {
+                if (hasCallPhonePermission()) finishPendingOutgoing()
+                else requestPermissions(arrayOf(android.Manifest.permission.CALL_PHONE), callPhoneRequestCode)
+            } else {
+                finishPendingOutgoing()
+            }
+            return
+        }
+        if (requestCode != callPhoneRequestCode) return
+        finishPendingOutgoing()
+    }
+
+    private fun finishPendingOutgoing() {
+        val targetId = pendingOutgoingTarget
+        val result = pendingOutgoingResult
+        pendingOutgoingTarget = null
+        pendingOutgoingResult = null
+        result?.success(targetId != null && hasPhoneAccountPermission() && hasCallPhonePermission() && placeOutgoingTelecomCall(targetId))
+    }
+
+    private fun hasCallPhonePermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            checkSelfPermission(android.Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasPhoneAccountPermission(): Boolean = TelecomHelper.hasPhoneAccountPermission(this)
+
+    private fun requestPhoneNumbersPermissionOrFail() {
+        if (hasPhoneAccountPermission()) {
+            requestPermissions(arrayOf(android.Manifest.permission.CALL_PHONE), callPhoneRequestCode)
+            return
+        }
+        val prefs = getSharedPreferences("cn_call_permissions", MODE_PRIVATE)
+        if (prefs.getBoolean("read_phone_numbers_requested", false)) {
+            finishPendingOutgoing()
+            return
+        }
+        prefs.edit().putBoolean("read_phone_numbers_requested", true).apply()
+        requestPermissions(arrayOf(android.Manifest.permission.READ_PHONE_NUMBERS), readPhoneNumbersRequestCode)
+    }
+
+    private fun placeOutgoingTelecomCall(targetId: String): Boolean {
+        TelecomHelper.register(this)
+        if (!hasPhoneAccountPermission()) return false
+        val manager = getSystemService(TELECOM_SERVICE) as TelecomManager
+        val account = TelecomHelper.getHandle(this)
+        val enabled = try { manager.getPhoneAccount(account)?.isEnabled == true } catch (_: SecurityException) { false }
+        if (!enabled || !manager.isOutgoingCallPermitted(account)) {
+            println("CN CALL Telecom: managed account unavailable for outgoing call")
+            return false
+        }
+        return try {
+            manager.placeCall(Uri.fromParts("tel", targetId, null), Bundle().apply {
+                putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
+            })
+            true
+        } catch (error: SecurityException) {
+            println("CN CALL Telecom: unable to place managed call: $error")
+            false
         }
     }
 }

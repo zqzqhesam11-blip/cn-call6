@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
 import hashlib
+import asyncio
 import hmac
 import json
 import os
@@ -46,6 +47,7 @@ active_calls: dict[str, dict[str, object]] = {}
 active_call_users: dict[str, str] = {}
 access_tokens: dict[str, str] = {}
 user_access_tokens: dict[str, str] = {}
+call_expiry_task: asyncio.Task | None = None
 
 
 def release_call(call_id: str, reason: str) -> bool:
@@ -69,6 +71,7 @@ def release_call(call_id: str, reason: str) -> bool:
     )
     db.commit()
     db.close()
+    print("[CN CALL][CALL TERMINAL] call_id=", call_id, "reason=", reason)
     return True
 
 
@@ -94,14 +97,15 @@ async def _send_terminal_call_event(
     if target_socket is not None:
         try:
             await target_socket.send_json(payload)
-            print("CALL TERMINAL WS:", message_type, call_id, target_id)
+            print("[CN CALL][CALL TERMINAL WS]", message_type, "call_id=", call_id, "target=", target_id)
             return
         except Exception as exc:
-            print("CALL TERMINAL WS ERROR:", exc)
+            print("[CN CALL][CALL TERMINAL WS ERROR]", exc)
 
     # Only the callee has an incoming native call UI to remove.  FCM is the
     # fallback when that UI exists without a WebSocket (background/terminated).
-    if message_type in {"call_cancelled", "hangup"}:
+    if message_type in {"call_cancelled", "call_reject", "hangup", "timeout", "disconnected"}:
+        print("[CN CALL][CALL TERMINAL FCM]", message_type, "call_id=", call_id, "target=", target_id)
         send_call_notification(
             target_id=target_id,
             caller_id=str(record["caller_id"]),
@@ -196,6 +200,31 @@ async def expire_active_calls():
                 target_id,
             )
         release_call(call_id, "timeout")
+
+
+async def _call_expiry_loop():
+    while True:
+        try:
+            await expire_active_calls()
+        except Exception as exc:
+            # Never let a transient FCM/WebSocket failure disable expiry for
+            # all following calls.
+            print("[CN CALL][CALL EXPIRY ERROR]", exc)
+        await asyncio.sleep(1)
+
+
+@app.on_event("startup")
+async def start_call_expiry_loop():
+    global call_expiry_task
+    call_expiry_task = asyncio.create_task(_call_expiry_loop())
+
+
+@app.on_event("shutdown")
+async def stop_call_expiry_loop():
+    global call_expiry_task
+    if call_expiry_task is not None:
+        call_expiry_task.cancel()
+        call_expiry_task = None
 
 FCM_TOKENS: dict[str, str] = {}
 
@@ -810,6 +839,17 @@ def livekit_token(
     if access_tokens.get(token) != user_id:
         raise HTTPException(status_code=401, detail="invalid session")
 
+    # A token must never create or revive a room for an ended/unknown call.
+    # Both endpoints can request their own token only while the server owns
+    # this exact active call.
+    record = active_calls.get(call_id.strip())
+    if (
+        record is None
+        or user_id not in {str(record["caller_id"]), str(record["target_id"])}
+        or str(record["status"]) not in {"accepted", "negotiating", "connected"}
+    ):
+        raise HTTPException(status_code=409, detail="unknown_or_ended_call")
+
     livekit_url = os.getenv("LIVEKIT_URL")
     livekit_key = os.getenv("LIVEKIT_API_KEY")
     livekit_secret = os.getenv("LIVEKIT_API_SECRET")
@@ -861,6 +901,7 @@ async def websocket_endpoint(
         # must not see itself as the active connection and release a call that
         # belongs to the replacement WebSocket.
         old_socket = connections.pop(user_id)
+        print("[CN CALL][SOCKET REPLACE] user_id=", user_id)
         try:
             await old_socket.close()
         except Exception:
@@ -869,6 +910,7 @@ async def websocket_endpoint(
     await websocket.accept()
 
     connections[user_id] = websocket
+    print("[CN CALL][SOCKET READY] user_id=", user_id)
 
     try:
         await websocket.send_json({
@@ -898,7 +940,7 @@ async def websocket_endpoint(
             message_type = str(message.get("type", "")).strip()
             call_id = str(message.get("call_id", "")).strip()
             target_id = str(message.get("target_id", "")).strip()
-            print("CALL MESSAGE:", message_type, call_id)
+            print("[CN CALL][CALL MESSAGE] type=", message_type, "call_id=", call_id, "from=", user_id)
 
             await expire_active_calls()
 
@@ -1019,6 +1061,7 @@ async def websocket_endpoint(
                     "connection_expires_at": None,
                     "caller_token": token,
                     "target_token": user_access_tokens.get(target_id),
+                    "media_ready_users": set(),
                 }
                 active_call_users[user_id] = call_id
                 active_call_users[target_id] = call_id
@@ -1142,13 +1185,23 @@ async def websocket_endpoint(
                 record["negotiation_expires_at"] = (
                     int(time.time() * 1000) + 30000
                 )
+                print("[CN CALL][CALL_ACCEPT SERVER] call_id=", call_id)
             elif message_type == "offer":
                 record["connection_expires_at"] = (
                     int(time.time() * 1000) + 30000
                 )
             elif message_type == "connected":
                 record["negotiation_expires_at"] = None
-                record["connection_expires_at"] = None
+                ready_users = record.setdefault("media_ready_users", set())
+                if isinstance(ready_users, set):
+                    ready_users.add(user_id)
+                    if {caller_id, receiver_id}.issubset(ready_users):
+                        record["status"] = "connected"
+                        record["connection_expires_at"] = None
+                    else:
+                        # One endpoint has local media, but the call is not
+                        # connected until both have reported a usable path.
+                        record["status"] = "negotiating"
             forwarded = {
                 **message,
                 "call_id": call_id,
@@ -1177,5 +1230,8 @@ async def websocket_endpoint(
     finally:
         if connections.get(user_id) is websocket:
             del connections[user_id]
-            await release_calls_for_user(user_id, token)
+            # A network reconnect is not a call hangup.  Keep ownership and
+            # let the call's explicit terminal signal or its expiry timer end
+            # it; the next socket for this logical user can safely resume.
+            print("[CN CALL][SOCKET CLOSED] user_id=", user_id)
 # cn-call2 railway test

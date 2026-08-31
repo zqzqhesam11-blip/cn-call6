@@ -49,11 +49,11 @@ Future<void> firebaseMessagingBackgroundHandler(
     return;
   }
 
-  if (type == 'call_cancelled') {
+  if (type == 'call_cancelled' || type == 'call_reject' || type == 'hangup' || type == 'timeout' || type == 'disconnected') {
     final callId = message.data['call_id']?.toString();
     await RtcCallManager.instance.handleRemoteTermination(
       callId: callId,
-      reason: 'cancelled',
+      reason: type == 'call_reject' ? 'rejected' : type == 'call_cancelled' ? 'cancelled' : 'ended',
     );
 
     print('FCM BACKGROUND: force-closed cancelled call');
@@ -121,11 +121,11 @@ class FirebaseMessagingService {
           final foregroundType =
               message.data['type']?.toString();
 
-          if (foregroundType == 'call_cancelled') {
+          if (foregroundType == 'call_cancelled' || foregroundType == 'call_reject' || foregroundType == 'hangup' || foregroundType == 'timeout' || foregroundType == 'disconnected') {
             final callId = message.data['call_id']?.toString();
             await RtcCallManager.instance.handleRemoteTermination(
               callId: callId,
-              reason: 'cancelled',
+              reason: foregroundType == 'call_reject' ? 'rejected' : foregroundType == 'call_cancelled' ? 'cancelled' : 'ended',
             );
 
             return;
