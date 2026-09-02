@@ -17,9 +17,6 @@ import org.json.JSONObject
 class CoreTelecomActionReceiver : BroadcastReceiver() {
 
     companion object {
-        const val ACTION_ACCEPT =
-            "com.example.mobile.CORE_TELECOM_ACCEPT"
-
         const val ACTION_REJECT =
             "com.example.mobile.CORE_TELECOM_REJECT"
 
@@ -41,7 +38,6 @@ class CoreTelecomActionReceiver : BroadcastReceiver() {
         val event = intent ?: return
 
         val action = when (event.action) {
-            ACTION_ACCEPT -> "accept"
             ACTION_REJECT -> "reject"
             ACTION_DISCONNECT -> "ended"
             else -> return

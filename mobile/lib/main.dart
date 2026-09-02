@@ -60,13 +60,6 @@ Future<void> _handleCoreTelecomAction(
   );
 
   switch (action) {
-    case 'accept':
-      await RtcCallManager.instance.acceptCall(
-        callerId: peerId,
-        callId: callId,
-      );
-      break;
-
     case 'reject':
       await RtcCallManager.instance.rejectCall(
         callerId: peerId,
@@ -104,9 +97,7 @@ Future<void> _handleTelecomAction(Map<Object?, Object?> arguments) async {
   final peerId = arguments['peerId']?.toString() ?? '';
   if (callId.isEmpty || peerId.isEmpty) return;
   print('[CN CALL][CALL ACTION RECEIVED] action=$action call_id=$callId');
-  if (action == 'accept') {
-    await RtcCallManager.instance.acceptCall(callerId: peerId, callId: callId);
-  } else if (action == 'outgoing') {
+  if (action == 'outgoing') {
     await RtcCallManager.instance.startCall(targetId: peerId, callId: callId);
   } else if (action == 'reject') {
     await RtcCallManager.instance.rejectCall(callerId: peerId, callId: callId);
@@ -201,30 +192,7 @@ Future<void> telecomBackgroundMain() async {
       final telecomPeerId = actionData['peerId']?.toString() ?? '';
       if (telecomCallId.isEmpty || telecomPeerId.isEmpty) continue;
       print('[CN CALL][TELECOM ACTION DEQUEUED] action=$telecomAction call_id=$telecomCallId');
-      if (telecomAction == 'accept') {
-      print(
-        '[CN CALL][TELECOM] background ACCEPT '
-        'call_id=$telecomCallId peer_id=$telecomPeerId',
-      );
-
-      await RtcCallManager.instance.acceptCall(
-        callerId: telecomPeerId,
-        callId: telecomCallId,
-      );
-
-      print(
-        '[CN CALL][TELECOM] background ACCEPT processed '
-        'call_id=$telecomCallId',
-      );
-
-      final mutedCallId =
-          prefs.getString('flutter.cn_call_telecom_mute_call_id') ?? '';
-      if (mutedCallId == telecomCallId) {
-        await RtcCallManager.instance.mute(
-          prefs.getBool('flutter.cn_call_telecom_is_muted') ?? false,
-        );
-      }
-      } else if (telecomAction == 'outgoing') {
+      if (telecomAction == 'outgoing') {
       await RtcCallManager.instance.startCall(
         targetId: telecomPeerId,
         callId: telecomCallId,
@@ -306,6 +274,19 @@ class _DedicatedIncomingCallFlow extends StatelessWidget {
   Widget build(BuildContext context) => IncomingCallScreen(
     name: callerName, id: callerId, callId: callId,
     onAccept: () async {
+      final permissionGranted = await const MethodChannel('cn_call/call').invokeMethod<bool>(
+        'recordAudioPermissionGranted',
+      ) ?? false;
+      if (!permissionGranted) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('يلزم السماح باستخدام الميكروفون لقبول المكالمة'),
+            ),
+          );
+        }
+        return;
+      }
       await RtcCallManager.instance.acceptCall(callerId: callerId, callId: callId, userInitiated: true);
       if (!context.mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => ActiveCallScreen(

@@ -60,6 +60,18 @@ class MainActivity : FlutterActivity() {
                         CoreTelecomFlutterDispatcher.markFlutterReady(this, flutterEngine)
                         result.success(true)
                     }
+                    "consumeCoreTelecomAnswer" -> result.success(
+                        CoreTelecomCallBridge.consumeAnswerRequested(
+                            this,
+                            call.argument<String>("callId").orEmpty(),
+                        ),
+                    )
+                    "clearCoreTelecomAnswer" -> result.success(
+                        CoreTelecomCallBridge.clearAnswerRequested(
+                            this,
+                            call.argument<String>("callId").orEmpty(),
+                        ),
+                    )
                     "startActiveCallForegroundService" -> result.success(CoreTelecomForegroundService.start(this, call.argument<String>("callId").orEmpty()))
                     "configureCallAudio" -> {
                         configureCallAudio(call.argument<Boolean>("speaker") == true)

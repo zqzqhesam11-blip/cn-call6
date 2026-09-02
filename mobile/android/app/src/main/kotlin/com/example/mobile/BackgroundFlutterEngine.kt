@@ -35,6 +35,12 @@ object BackgroundFlutterEngine {
                     CoreTelecomFlutterDispatcher.markFlutterReady(appContext, engine)
                     result.success(true)
                 }
+                "clearCoreTelecomAnswer" -> result.success(
+                    CoreTelecomCallBridge.clearAnswerRequested(
+                        appContext,
+                        callId,
+                    ),
+                )
                 else -> result.notImplemented()
             }
         }

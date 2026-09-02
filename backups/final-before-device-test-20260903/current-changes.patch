@@ -1,0 +1,464 @@
+diff --git a/mobile/android/app/src/main/kotlin/com/example/mobile/BackgroundFlutterEngine.kt b/mobile/android/app/src/main/kotlin/com/example/mobile/BackgroundFlutterEngine.kt
+index c314ac6..965b9a6 100644
+--- a/mobile/android/app/src/main/kotlin/com/example/mobile/BackgroundFlutterEngine.kt
++++ b/mobile/android/app/src/main/kotlin/com/example/mobile/BackgroundFlutterEngine.kt
+@@ -35,6 +35,12 @@ object BackgroundFlutterEngine {
+                     CoreTelecomFlutterDispatcher.markFlutterReady(appContext, engine)
+                     result.success(true)
+                 }
++                "clearCoreTelecomAnswer" -> result.success(
++                    CoreTelecomCallBridge.clearAnswerRequested(
++                        appContext,
++                        callId,
++                    ),
++                )
+                 else -> result.notImplemented()
+             }
+         }
+diff --git a/mobile/android/app/src/main/kotlin/com/example/mobile/CNCallIncomingActivity.kt b/mobile/android/app/src/main/kotlin/com/example/mobile/CNCallIncomingActivity.kt
+index 50c7aa4..ce2ce45 100644
+--- a/mobile/android/app/src/main/kotlin/com/example/mobile/CNCallIncomingActivity.kt
++++ b/mobile/android/app/src/main/kotlin/com/example/mobile/CNCallIncomingActivity.kt
+@@ -64,8 +64,27 @@ class CNCallIncomingActivity : FlutterActivity() {
+                         result.success(mapOf("callId" to callId, "callerId" to callerId, "callerName" to callerName))
+                     }
+                 }
++                "recordAudioPermissionGranted" -> result.success(hasRecordAudioPermission())
++                "consumeCoreTelecomAnswer" -> result.success(
++                    CoreTelecomCallBridge.consumeAnswerRequested(
++                        this,
++                        call.argument<String>("callId").orEmpty(),
++                    ),
++                )
++                "clearCoreTelecomAnswer" -> result.success(
++                    CoreTelecomCallBridge.clearAnswerRequested(
++                        this,
++                        call.argument<String>("callId").orEmpty(),
++                    ),
++                )
+                 "activateTelecomCall" -> CoroutineScope(Dispatchers.Default).launch { result.success(CoreTelecomCallBridge.activateCall(call.argument<String>("callId").orEmpty())) }
+-                "startActiveCallForegroundService" -> result.success(CoreTelecomForegroundService.start(this, call.argument<String>("callId").orEmpty()))
++                "startActiveCallForegroundService" -> {
++                    if (!hasRecordAudioPermission()) {
++                        result.success(false)
++                    } else {
++                        result.success(CoreTelecomForegroundService.start(this, call.argument<String>("callId").orEmpty()))
++                    }
++                }
+                 "disconnectTelecomCall" -> CoroutineScope(Dispatchers.Default).launch { result.success(CoreTelecomCallBridge.disconnectCall(call.argument<String>("callId").orEmpty(), "ended")) }
+                 "playDefaultRingtone" -> {
+                     ringtone?.stop()
+@@ -81,5 +100,11 @@ class CNCallIncomingActivity : FlutterActivity() {
+ 
+     override fun getDartEntrypointFunctionName(): String = "incomingCallUiMain"
+ 
++    private fun hasRecordAudioPermission(): Boolean {
++        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
++            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
++                PackageManager.PERMISSION_GRANTED
++    }
++
+     companion object { const val ACTION_TERMINAL = "com.example.mobile.CN_CALL_TERMINAL" }
+ }
+diff --git a/mobile/android/app/src/main/kotlin/com/example/mobile/CallFirebaseService.kt b/mobile/android/app/src/main/kotlin/com/example/mobile/CallFirebaseService.kt
+index 7ea9184..8660df3 100644
+--- a/mobile/android/app/src/main/kotlin/com/example/mobile/CallFirebaseService.kt
++++ b/mobile/android/app/src/main/kotlin/com/example/mobile/CallFirebaseService.kt
+@@ -100,6 +100,7 @@ return
+ 
+     private fun markCallEnded(callId: String) {
+         CoreTelecomNotification.cancelForCall(this, callId)
++        CoreTelecomCallBridge.clearAnswerRequested(this, callId)
+         val prefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+         val endedIds = endedCallIds(prefs).toMutableList()
+         endedIds.remove(callId)
+diff --git a/mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomActionReceiver.kt b/mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomActionReceiver.kt
+index 1dec400..a85ffe9 100644
+--- a/mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomActionReceiver.kt
++++ b/mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomActionReceiver.kt
+@@ -17,9 +17,6 @@ import org.json.JSONObject
+ class CoreTelecomActionReceiver : BroadcastReceiver() {
+ 
+     companion object {
+-        const val ACTION_ACCEPT =
+-            "com.example.mobile.CORE_TELECOM_ACCEPT"
+-
+         const val ACTION_REJECT =
+             "com.example.mobile.CORE_TELECOM_REJECT"
+ 
+@@ -41,7 +38,6 @@ class CoreTelecomActionReceiver : BroadcastReceiver() {
+         val event = intent ?: return
+ 
+         val action = when (event.action) {
+-            ACTION_ACCEPT -> "accept"
+             ACTION_REJECT -> "reject"
+             ACTION_DISCONNECT -> "ended"
+             else -> return
+diff --git a/mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomCallBridge.kt b/mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomCallBridge.kt
+index df591ab..d89a27f 100644
+--- a/mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomCallBridge.kt
++++ b/mobile/android/app/src/main/kotlin/com/example/mobile/CoreTelecomCallBridge.kt
+@@ -31,6 +31,8 @@ object CoreTelecomCallBridge {
+ 
+     private const val ACTION_QUEUE_KEY =
+         "flutter.cn_call_core_telecom_actions_v1"
++    private const val ANSWER_REQUESTED_KEY =
++        "flutter.cn_call_core_telecom_answer_requested_call_ids_v1"
+ 
+     private val worker =
+         CoroutineScope(
+@@ -177,6 +179,7 @@ object CoreTelecomCallBridge {
+                             id,
+                             CoreTelecomCallRegistry.State.ANSWERING,
+                         )
++                        recordAnswerRequested(context, id)
+ 
+                         println(
+                             "[CN CALL][CORE TELECOM] " +
+@@ -184,17 +187,10 @@ object CoreTelecomCallBridge {
+                                 "call_id=$id type=$callType"
+                         )
+ 
+-                        CoreTelecomFlutterDispatcher.dispatch(
+-                            context = context,
+-                            action = "accept",
+-                            callId = id,
+-                            peerId = runtime.peerId,
+-                            name = runtime.displayName,
+-                        )
+-
+                         println(
+                             "[CN CALL][CORE TELECOM] " +
+-                                "ACCEPT FORWARDED TO FLUTTER " +
++                                "ANSWER RECORDED; CUSTOM CN CALL ACCEPT " +
++                                "OWNS DART LIFECYCLE " +
+                                 "call_id=$id"
+                         )
+                     },
+@@ -246,6 +242,7 @@ object CoreTelecomCallBridge {
+                                     "call_id=$id"
+                             )
+                         }
++                        clearAnswerRequested(context, id)
+                     },
+                     onSetActive = {
+                         CoreTelecomCallRegistry.setState(
+@@ -591,65 +588,6 @@ object CoreTelecomCallBridge {
+         val id = callId
+         when (action.optString("action")) {
+ 
+-            "accept" -> {
+-                val runtime =
+-                    CoreTelecomCallRegistry.get(callId)
+-                        ?: return
+-
+-                if (runtime.state == CoreTelecomCallRegistry.State.ENDING ||
+-                    runtime.state == CoreTelecomCallRegistry.State.ENDED
+-                ) {
+-                    println(
+-                        "[CN CALL][CORE TELECOM] " +
+-                            "QUEUED ACCEPT BLOCKED: terminal " +
+-                            "call_id=$callId state=${runtime.state}"
+-                    )
+-                    return
+-                }
+-
+-                if (!runtime.incoming) {
+-                    println(
+-                        "[CN CALL][CORE TELECOM] " +
+-                            "ACCEPT IGNORED: not incoming " +
+-                            "call_id=$callId"
+-                    )
+-                    return
+-                }
+-
+-                if (
+-                    runtime.state == CoreTelecomCallRegistry.State.ENDING ||
+-                    runtime.state == CoreTelecomCallRegistry.State.ENDED ||
+-                    runtime.state == CoreTelecomCallRegistry.State.ACTIVE
+-                ) {
+-                    return
+-                }
+-
+-                /*
+-                 * The system onAnswer callback is the authoritative
+-                 * indication that the user answered the incoming call.
+-                 *
+-                 * Do NOT call scope.answer() here again.
+-                 */
+-                CoreTelecomCallRegistry.setState(
+-                    callId,
+-                    CoreTelecomCallRegistry.State.ANSWERING,
+-                )
+-
+-                CoreTelecomFlutterDispatcher.dispatch(
+-                    context = context,
+-                    action = "accept",
+-                    callId = callId,
+-                    peerId = runtime.peerId,
+-                    name = runtime.displayName,
+-                )
+-
+-                println(
+-                    "[CN CALL][CORE TELECOM] " +
+-                        "ACCEPT FORWARDED TO FLUTTER " +
+-                        "call_id=$callId"
+-                )
+-            }
+-
+                         "reject" -> {
+                 val runtime =
+                     CoreTelecomCallRegistry.get(callId)
+@@ -785,6 +723,89 @@ object CoreTelecomCallBridge {
+         }
+     }
+ 
++    private fun recordAnswerRequested(
++        context: Context,
++        callId: String,
++    ) {
++        updateAnswerRequested(context, callId, add = true)
++    }
++
++    fun consumeAnswerRequested(
++        context: Context,
++        callId: String,
++    ): Boolean {
++        return clearAnswerRequested(context, callId)
++    }
++
++    fun clearAnswerRequested(
++        context: Context,
++        callId: String,
++    ): Boolean {
++        return updateAnswerRequested(context, callId, add = false)
++    }
++
++    private fun updateAnswerRequested(
++        context: Context,
++        callId: String,
++        add: Boolean,
++    ): Boolean {
++        val id = callId.trim()
++        if (id.isEmpty()) return false
++
++        val prefs =
++            context.applicationContext.getSharedPreferences(
++                "FlutterSharedPreferences",
++                Context.MODE_PRIVATE,
++            )
++        val answerRequested =
++            try {
++                JSONArray(
++                    prefs.getString(
++                        ANSWER_REQUESTED_KEY,
++                        "[]",
++                    ),
++                )
++            } catch (_: Exception) {
++                JSONArray()
++            }
++
++        var present = false
++        for (index in 0 until answerRequested.length()) {
++            if (answerRequested.optString(index) == id) {
++                present = true
++                break
++            }
++        }
++
++        if (add && !present) {
++            answerRequested.put(id)
++        } else if (!add && present) {
++            for (index in answerRequested.length() - 1 downTo 0) {
++                if (answerRequested.optString(index) == id) {
++                    answerRequested.remove(index)
++                }
++            }
++        }
++
++        val changed = add != present
++        if (changed) {
++            val editor = prefs.edit()
++            if (!add && answerRequested.length() == 0) {
++                editor.remove(ANSWER_REQUESTED_KEY)
++            } else {
++                editor.putString(
++                    ANSWER_REQUESTED_KEY,
++                    answerRequested.toString(),
++                )
++            }
++            if (!editor.commit()) {
++                return false
++            }
++        }
++
++        return true
++    }
++
+     private fun peekQueuedAction(
+         context: Context,
+         callId: String,
+diff --git a/mobile/android/app/src/main/kotlin/com/example/mobile/MainActivity.kt b/mobile/android/app/src/main/kotlin/com/example/mobile/MainActivity.kt
+index bf9335b..97dc4ec 100644
+--- a/mobile/android/app/src/main/kotlin/com/example/mobile/MainActivity.kt
++++ b/mobile/android/app/src/main/kotlin/com/example/mobile/MainActivity.kt
+@@ -60,6 +60,18 @@ class MainActivity : FlutterActivity() {
+                         CoreTelecomFlutterDispatcher.markFlutterReady(this, flutterEngine)
+                         result.success(true)
+                     }
++                    "consumeCoreTelecomAnswer" -> result.success(
++                        CoreTelecomCallBridge.consumeAnswerRequested(
++                            this,
++                            call.argument<String>("callId").orEmpty(),
++                        ),
++                    )
++                    "clearCoreTelecomAnswer" -> result.success(
++                        CoreTelecomCallBridge.clearAnswerRequested(
++                            this,
++                            call.argument<String>("callId").orEmpty(),
++                        ),
++                    )
+                     "startActiveCallForegroundService" -> result.success(CoreTelecomForegroundService.start(this, call.argument<String>("callId").orEmpty()))
+                     "configureCallAudio" -> {
+                         configureCallAudio(call.argument<Boolean>("speaker") == true)
+diff --git a/mobile/lib/main.dart b/mobile/lib/main.dart
+index 2b1df1a..cfa297e 100644
+--- a/mobile/lib/main.dart
++++ b/mobile/lib/main.dart
+@@ -60,13 +60,6 @@ Future<void> _handleCoreTelecomAction(
+   );
+ 
+   switch (action) {
+-    case 'accept':
+-      await RtcCallManager.instance.acceptCall(
+-        callerId: peerId,
+-        callId: callId,
+-      );
+-      break;
+-
+     case 'reject':
+       await RtcCallManager.instance.rejectCall(
+         callerId: peerId,
+@@ -104,9 +97,7 @@ Future<void> _handleTelecomAction(Map<Object?, Object?> arguments) async {
+   final peerId = arguments['peerId']?.toString() ?? '';
+   if (callId.isEmpty || peerId.isEmpty) return;
+   print('[CN CALL][CALL ACTION RECEIVED] action=$action call_id=$callId');
+-  if (action == 'accept') {
+-    await RtcCallManager.instance.acceptCall(callerId: peerId, callId: callId);
+-  } else if (action == 'outgoing') {
++  if (action == 'outgoing') {
+     await RtcCallManager.instance.startCall(targetId: peerId, callId: callId);
+   } else if (action == 'reject') {
+     await RtcCallManager.instance.rejectCall(callerId: peerId, callId: callId);
+@@ -201,30 +192,7 @@ Future<void> telecomBackgroundMain() async {
+       final telecomPeerId = actionData['peerId']?.toString() ?? '';
+       if (telecomCallId.isEmpty || telecomPeerId.isEmpty) continue;
+       print('[CN CALL][TELECOM ACTION DEQUEUED] action=$telecomAction call_id=$telecomCallId');
+-      if (telecomAction == 'accept') {
+-      print(
+-        '[CN CALL][TELECOM] background ACCEPT '
+-        'call_id=$telecomCallId peer_id=$telecomPeerId',
+-      );
+-
+-      await RtcCallManager.instance.acceptCall(
+-        callerId: telecomPeerId,
+-        callId: telecomCallId,
+-      );
+-
+-      print(
+-        '[CN CALL][TELECOM] background ACCEPT processed '
+-        'call_id=$telecomCallId',
+-      );
+-
+-      final mutedCallId =
+-          prefs.getString('flutter.cn_call_telecom_mute_call_id') ?? '';
+-      if (mutedCallId == telecomCallId) {
+-        await RtcCallManager.instance.mute(
+-          prefs.getBool('flutter.cn_call_telecom_is_muted') ?? false,
+-        );
+-      }
+-      } else if (telecomAction == 'outgoing') {
++      if (telecomAction == 'outgoing') {
+       await RtcCallManager.instance.startCall(
+         targetId: telecomPeerId,
+         callId: telecomCallId,
+@@ -306,6 +274,19 @@ class _DedicatedIncomingCallFlow extends StatelessWidget {
+   Widget build(BuildContext context) => IncomingCallScreen(
+     name: callerName, id: callerId, callId: callId,
+     onAccept: () async {
++      final permissionGranted = await const MethodChannel('cn_call/call').invokeMethod<bool>(
++        'recordAudioPermissionGranted',
++      ) ?? false;
++      if (!permissionGranted) {
++        if (context.mounted) {
++          ScaffoldMessenger.of(context).showSnackBar(
++            const SnackBar(
++              content: Text('يلزم السماح باستخدام الميكروفون لقبول المكالمة'),
++            ),
++          );
++        }
++        return;
++      }
+       await RtcCallManager.instance.acceptCall(callerId: callerId, callId: callId, userInitiated: true);
+       if (!context.mounted) return;
+       Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => ActiveCallScreen(
+diff --git a/mobile/lib/services/rtc_call_manager.dart b/mobile/lib/services/rtc_call_manager.dart
+index 84dd09d..de10f63 100644
+--- a/mobile/lib/services/rtc_call_manager.dart
++++ b/mobile/lib/services/rtc_call_manager.dart
+@@ -451,6 +451,14 @@ class RtcCallManager {
+     }
+ 
+     if (userInitiated) {
++      final consumed = await const MethodChannel('cn_call/call').invokeMethod<bool>(
++        'consumeCoreTelecomAnswer',
++        <String, dynamic>{'callId': acceptedCallId},
++      ) ?? false;
++      if (!consumed) {
++        throw StateError('Unable to consume Core-Telecom answer state');
++      }
++
+       try {
+         await const MethodChannel('cn_call/call').invokeMethod(
+           'startActiveCallForegroundService',
+@@ -639,6 +647,7 @@ class RtcCallManager {
+ 
+       await session.markCallEnded(callId);
+       await session.clearPendingIncomingCall(callId);
++      await _clearCoreTelecomAnswer(callId);
+       if (callId != null) CallCoordinator.instance.markEnded(callId);
+ 
+       if (callId != null && callId.isNotEmpty) {
+@@ -776,6 +785,7 @@ class RtcCallManager {
+      */
+     await session.markCallEnded(id);
+     await session.clearPendingIncomingCall(id);
++    await _clearCoreTelecomAnswer(id);
+ 
+     if (!_isCurrentCall(id)) {
+       return;
+@@ -820,6 +830,23 @@ class RtcCallManager {
+     );
+   }
+ 
++  Future<void> _clearCoreTelecomAnswer(String? callId) async {
++    final id = callId?.trim() ?? '';
++    if (id.isEmpty) return;
++
++    try {
++      await const MethodChannel('cn_call/call').invokeMethod(
++        'clearCoreTelecomAnswer',
++        <String, dynamic>{'callId': id},
++      );
++    } catch (error) {
++      print(
++        '[CN CALL][CORE TELECOM] answer marker clear failed '
++        'call_id=$id error=$error',
++      );
++    }
++  }
++
+ 
+   Future<void> _failTelecomAndCleanup(String callId, {required String reason}) async {
+     await _cleanupCall(reason: reason, sendSignal: true, signalType: 'hangup');

@@ -451,6 +451,14 @@ class RtcCallManager {
     }
 
     if (userInitiated) {
+      final consumed = await const MethodChannel('cn_call/call').invokeMethod<bool>(
+        'consumeCoreTelecomAnswer',
+        <String, dynamic>{'callId': acceptedCallId},
+      ) ?? false;
+      if (!consumed) {
+        throw StateError('Unable to consume Core-Telecom answer state');
+      }
+
       try {
         await const MethodChannel('cn_call/call').invokeMethod(
           'startActiveCallForegroundService',
@@ -639,6 +647,7 @@ class RtcCallManager {
 
       await session.markCallEnded(callId);
       await session.clearPendingIncomingCall(callId);
+      await _clearCoreTelecomAnswer(callId);
       if (callId != null) CallCoordinator.instance.markEnded(callId);
 
       if (callId != null && callId.isNotEmpty) {
@@ -776,6 +785,7 @@ class RtcCallManager {
      */
     await session.markCallEnded(id);
     await session.clearPendingIncomingCall(id);
+    await _clearCoreTelecomAnswer(id);
 
     if (!_isCurrentCall(id)) {
       return;
@@ -818,6 +828,23 @@ class RtcCallManager {
       '[CN CALL][CALL TERMINAL RECONCILED] '
       'call_id=$id reason=$reason',
     );
+  }
+
+  Future<void> _clearCoreTelecomAnswer(String? callId) async {
+    final id = callId?.trim() ?? '';
+    if (id.isEmpty) return;
+
+    try {
+      await const MethodChannel('cn_call/call').invokeMethod(
+        'clearCoreTelecomAnswer',
+        <String, dynamic>{'callId': id},
+      );
+    } catch (error) {
+      print(
+        '[CN CALL][CORE TELECOM] answer marker clear failed '
+        'call_id=$id error=$error',
+      );
+    }
   }
 
 

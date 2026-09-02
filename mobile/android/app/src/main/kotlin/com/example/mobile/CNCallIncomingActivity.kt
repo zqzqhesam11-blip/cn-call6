@@ -64,8 +64,27 @@ class CNCallIncomingActivity : FlutterActivity() {
                         result.success(mapOf("callId" to callId, "callerId" to callerId, "callerName" to callerName))
                     }
                 }
+                "recordAudioPermissionGranted" -> result.success(hasRecordAudioPermission())
+                "consumeCoreTelecomAnswer" -> result.success(
+                    CoreTelecomCallBridge.consumeAnswerRequested(
+                        this,
+                        call.argument<String>("callId").orEmpty(),
+                    ),
+                )
+                "clearCoreTelecomAnswer" -> result.success(
+                    CoreTelecomCallBridge.clearAnswerRequested(
+                        this,
+                        call.argument<String>("callId").orEmpty(),
+                    ),
+                )
                 "activateTelecomCall" -> CoroutineScope(Dispatchers.Default).launch { result.success(CoreTelecomCallBridge.activateCall(call.argument<String>("callId").orEmpty())) }
-                "startActiveCallForegroundService" -> result.success(CoreTelecomForegroundService.start(this, call.argument<String>("callId").orEmpty()))
+                "startActiveCallForegroundService" -> {
+                    if (!hasRecordAudioPermission()) {
+                        result.success(false)
+                    } else {
+                        result.success(CoreTelecomForegroundService.start(this, call.argument<String>("callId").orEmpty()))
+                    }
+                }
                 "disconnectTelecomCall" -> CoroutineScope(Dispatchers.Default).launch { result.success(CoreTelecomCallBridge.disconnectCall(call.argument<String>("callId").orEmpty(), "ended")) }
                 "playDefaultRingtone" -> {
                     ringtone?.stop()
@@ -80,6 +99,12 @@ class CNCallIncomingActivity : FlutterActivity() {
     }
 
     override fun getDartEntrypointFunctionName(): String = "incomingCallUiMain"
+
+    private fun hasRecordAudioPermission(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+    }
 
     companion object { const val ACTION_TERMINAL = "com.example.mobile.CN_CALL_TERMINAL" }
 }

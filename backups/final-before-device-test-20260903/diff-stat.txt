@@ -1,0 +1,9 @@
+ .../com/example/mobile/BackgroundFlutterEngine.kt  |   6 +
+ .../com/example/mobile/CNCallIncomingActivity.kt   |  27 +++-
+ .../com/example/mobile/CallFirebaseService.kt      |   1 +
+ .../example/mobile/CoreTelecomActionReceiver.kt    |   4 -
+ .../com/example/mobile/CoreTelecomCallBridge.kt    | 157 ++++++++++++---------
+ .../main/kotlin/com/example/mobile/MainActivity.kt |  12 ++
+ mobile/lib/main.dart                               |  49 ++-----
+ mobile/lib/services/rtc_call_manager.dart          |  27 ++++
+ 8 files changed, 176 insertions(+), 107 deletions(-)

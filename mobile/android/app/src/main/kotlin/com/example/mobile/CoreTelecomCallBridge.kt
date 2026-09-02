@@ -31,6 +31,8 @@ object CoreTelecomCallBridge {
 
     private const val ACTION_QUEUE_KEY =
         "flutter.cn_call_core_telecom_actions_v1"
+    private const val ANSWER_REQUESTED_KEY =
+        "flutter.cn_call_core_telecom_answer_requested_call_ids_v1"
 
     private val worker =
         CoroutineScope(
@@ -177,6 +179,7 @@ object CoreTelecomCallBridge {
                             id,
                             CoreTelecomCallRegistry.State.ANSWERING,
                         )
+                        recordAnswerRequested(context, id)
 
                         println(
                             "[CN CALL][CORE TELECOM] " +
@@ -184,17 +187,10 @@ object CoreTelecomCallBridge {
                                 "call_id=$id type=$callType"
                         )
 
-                        CoreTelecomFlutterDispatcher.dispatch(
-                            context = context,
-                            action = "accept",
-                            callId = id,
-                            peerId = runtime.peerId,
-                            name = runtime.displayName,
-                        )
-
                         println(
                             "[CN CALL][CORE TELECOM] " +
-                                "ACCEPT FORWARDED TO FLUTTER " +
+                                "ANSWER RECORDED; CUSTOM CN CALL ACCEPT " +
+                                "OWNS DART LIFECYCLE " +
                                 "call_id=$id"
                         )
                     },
@@ -246,6 +242,7 @@ object CoreTelecomCallBridge {
                                     "call_id=$id"
                             )
                         }
+                        clearAnswerRequested(context, id)
                     },
                     onSetActive = {
                         CoreTelecomCallRegistry.setState(
@@ -591,65 +588,6 @@ object CoreTelecomCallBridge {
         val id = callId
         when (action.optString("action")) {
 
-            "accept" -> {
-                val runtime =
-                    CoreTelecomCallRegistry.get(callId)
-                        ?: return
-
-                if (runtime.state == CoreTelecomCallRegistry.State.ENDING ||
-                    runtime.state == CoreTelecomCallRegistry.State.ENDED
-                ) {
-                    println(
-                        "[CN CALL][CORE TELECOM] " +
-                            "QUEUED ACCEPT BLOCKED: terminal " +
-                            "call_id=$callId state=${runtime.state}"
-                    )
-                    return
-                }
-
-                if (!runtime.incoming) {
-                    println(
-                        "[CN CALL][CORE TELECOM] " +
-                            "ACCEPT IGNORED: not incoming " +
-                            "call_id=$callId"
-                    )
-                    return
-                }
-
-                if (
-                    runtime.state == CoreTelecomCallRegistry.State.ENDING ||
-                    runtime.state == CoreTelecomCallRegistry.State.ENDED ||
-                    runtime.state == CoreTelecomCallRegistry.State.ACTIVE
-                ) {
-                    return
-                }
-
-                /*
-                 * The system onAnswer callback is the authoritative
-                 * indication that the user answered the incoming call.
-                 *
-                 * Do NOT call scope.answer() here again.
-                 */
-                CoreTelecomCallRegistry.setState(
-                    callId,
-                    CoreTelecomCallRegistry.State.ANSWERING,
-                )
-
-                CoreTelecomFlutterDispatcher.dispatch(
-                    context = context,
-                    action = "accept",
-                    callId = callId,
-                    peerId = runtime.peerId,
-                    name = runtime.displayName,
-                )
-
-                println(
-                    "[CN CALL][CORE TELECOM] " +
-                        "ACCEPT FORWARDED TO FLUTTER " +
-                        "call_id=$callId"
-                )
-            }
-
                         "reject" -> {
                 val runtime =
                     CoreTelecomCallRegistry.get(callId)
@@ -783,6 +721,89 @@ object CoreTelecomCallBridge {
                 }
             }
         }
+    }
+
+    private fun recordAnswerRequested(
+        context: Context,
+        callId: String,
+    ) {
+        updateAnswerRequested(context, callId, add = true)
+    }
+
+    fun consumeAnswerRequested(
+        context: Context,
+        callId: String,
+    ): Boolean {
+        return clearAnswerRequested(context, callId)
+    }
+
+    fun clearAnswerRequested(
+        context: Context,
+        callId: String,
+    ): Boolean {
+        return updateAnswerRequested(context, callId, add = false)
+    }
+
+    private fun updateAnswerRequested(
+        context: Context,
+        callId: String,
+        add: Boolean,
+    ): Boolean {
+        val id = callId.trim()
+        if (id.isEmpty()) return false
+
+        val prefs =
+            context.applicationContext.getSharedPreferences(
+                "FlutterSharedPreferences",
+                Context.MODE_PRIVATE,
+            )
+        val answerRequested =
+            try {
+                JSONArray(
+                    prefs.getString(
+                        ANSWER_REQUESTED_KEY,
+                        "[]",
+                    ),
+                )
+            } catch (_: Exception) {
+                JSONArray()
+            }
+
+        var present = false
+        for (index in 0 until answerRequested.length()) {
+            if (answerRequested.optString(index) == id) {
+                present = true
+                break
+            }
+        }
+
+        if (add && !present) {
+            answerRequested.put(id)
+        } else if (!add && present) {
+            for (index in answerRequested.length() - 1 downTo 0) {
+                if (answerRequested.optString(index) == id) {
+                    answerRequested.remove(index)
+                }
+            }
+        }
+
+        val changed = add != present
+        if (changed) {
+            val editor = prefs.edit()
+            if (!add && answerRequested.length() == 0) {
+                editor.remove(ANSWER_REQUESTED_KEY)
+            } else {
+                editor.putString(
+                    ANSWER_REQUESTED_KEY,
+                    answerRequested.toString(),
+                )
+            }
+            if (!editor.commit()) {
+                return false
+            }
+        }
+
+        return true
     }
 
     private fun peekQueuedAction(

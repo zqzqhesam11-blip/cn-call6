@@ -100,6 +100,7 @@ return
 
     private fun markCallEnded(callId: String) {
         CoreTelecomNotification.cancelForCall(this, callId)
+        CoreTelecomCallBridge.clearAnswerRequested(this, callId)
         val prefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
         val endedIds = endedCallIds(prefs).toMutableList()
         endedIds.remove(callId)
