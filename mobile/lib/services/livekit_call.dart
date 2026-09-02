@@ -1,5 +1,6 @@
 // ignore_for_file: avoid_print
 
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:livekit_client/livekit_client.dart';
 
 class LiveKitCall {
@@ -50,6 +51,13 @@ class LiveKitCall {
 
     print('[CN CALL][LIVEKIT CONNECT START]');
 
+    // Match the proven WebRTC call audio setup.
+    // Telecom remains the owner of the managed call state/routing.
+    await Helper.setAndroidAudioConfiguration(
+      AndroidAudioConfiguration.communication,
+    );
+    await Helper.setSpeakerphoneOn(false);
+
     await _room!.connect(url, token);
 
     print('[CN CALL][LIVEKIT CONNECTED] localParticipant=${_room!.localParticipant != null}');
@@ -86,6 +94,26 @@ class LiveKitCall {
   }
 
   Future<void> _enableAndVerifyMicrophone() async {
+
+    try {
+      final stream = await navigator.mediaDevices.getUserMedia({
+        'audio': true,
+        'video': false,
+      });
+
+      print(
+        '[CN CALL][MIC PERMISSION] granted '
+        'tracks=${stream.getAudioTracks().length}',
+      );
+
+      for (final track in stream.getAudioTracks()) {
+        await track.stop();
+      }
+    } catch (e) {
+      print('[CN CALL][MIC PERMISSION FAILED] error=$e');
+      throw StateError('Microphone permission denied');
+    }
+
     final participant = _room?.localParticipant;
     if (participant == null) {
       throw StateError('LiveKit local participant is unavailable');

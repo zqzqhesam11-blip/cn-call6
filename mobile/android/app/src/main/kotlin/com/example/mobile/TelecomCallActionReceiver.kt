@@ -8,6 +8,9 @@ import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.embedding.engine.dart.DartExecutor
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugins.GeneratedPluginRegistrant
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -19,6 +22,84 @@ class TelecomCallActionReceiver : BroadcastReceiver() {
         private const val EVENTS_CHANNEL = "cn_call/telecom_events"
         private const val ACTION_QUEUE_KEY = "flutter.cn_call_telecom_actions_v1"
         private const val CALL_CHANNEL = "cn_call/call"
+
+        fun ensureCoreTelecomFlutter(context: Context) {
+            ensureBackgroundFlutter(context)
+        }
+
+        fun ensureBackgroundFlutter(context: Context) {
+            val cache = FlutterEngineCache.getInstance()
+            if (cache.get(ENGINE_ID) != null) return
+
+            val appContext = context.applicationContext
+            val engine = FlutterEngine(appContext)
+
+            GeneratedPluginRegistrant.registerWith(engine)
+            installNativeCallChannel(engine, appContext)
+            cache.put(ENGINE_ID, engine)
+
+            engine.dartExecutor.executeDartEntrypoint(
+                DartExecutor.DartEntrypoint(
+                    "flutter_assets",
+                    "package:mobile/main.dart",
+                    "telecomBackgroundMain",
+                )
+            )
+
+            println("CN CALL Telecom: headless Flutter engine started")
+        }
+
+        private fun installNativeCallChannel(
+            engine: FlutterEngine,
+            context: Context,
+        ) {
+            MethodChannel(engine.dartExecutor.binaryMessenger, CALL_CHANNEL)
+                .setMethodCallHandler { call, result ->
+                    val callId = call.argument<String>("callId").orEmpty().trim()
+
+                    when (call.method) {
+                        "disconnectTelecomCall" -> {
+                            CoroutineScope(Dispatchers.Default).launch {
+                                result.success(
+                                    CoreTelecomCallBridge.disconnectCall(
+                                        callId = callId,
+                                        reason = "ended",
+                                    )
+                                )
+                            }
+                        }
+
+                        "activateTelecomCall" -> {
+                            CoroutineScope(Dispatchers.Default).launch {
+                                result.success(
+                                    CoreTelecomCallBridge.activateCall(callId)
+                                )
+                            }
+                        }
+
+                        "failTelecomCall" -> {
+                            CoroutineScope(Dispatchers.Default).launch {
+                                result.success(
+                                    CoreTelecomCallBridge.disconnectCall(
+                                        callId = callId,
+                                        reason = "failed",
+                                    )
+                                )
+                            }
+                        }
+
+                        "coreTelecomFlutterReady" -> {
+                            CoreTelecomFlutterDispatcher.markFlutterReady(
+                                context,
+                                engine,
+                            )
+                            result.success(true)
+                        }
+
+                        else -> result.notImplemented()
+                    }
+                }
+        }
     }
 
     override fun onReceive(context: Context, intent: Intent?) {
@@ -65,48 +146,16 @@ class TelecomCallActionReceiver : BroadcastReceiver() {
                 }
 
                 val existingEngine = FlutterEngineCache.getInstance().get(ENGINE_ID)
-                startBackgroundFlutter(context)
+                ensureBackgroundFlutter(context)
                 existingEngine?.let { dispatchActionToFlutter(it, action, callId, peerId) }
             }
             "reject", "ended" -> {
                 CallForegroundService.stop(context)
                 val existingEngine = FlutterEngineCache.getInstance().get(ENGINE_ID)
-                startBackgroundFlutter(context)
+                ensureBackgroundFlutter(context)
                 existingEngine?.let { dispatchActionToFlutter(it, action, callId, peerId) }
             }
         }
-    }
-
-    private fun startBackgroundFlutter(context: Context) {
-        val cache = FlutterEngineCache.getInstance()
-        if (cache.get(ENGINE_ID) != null) return
-        val engine = FlutterEngine(context.applicationContext)
-        GeneratedPluginRegistrant.registerWith(engine)
-        installNativeCallChannel(engine)
-        cache.put(ENGINE_ID, engine)
-        engine.dartExecutor.executeDartEntrypoint(
-            DartExecutor.DartEntrypoint("flutter_assets", "package:mobile/main.dart", "telecomBackgroundMain")
-        )
-        println("CN CALL Telecom: headless Flutter engine started")
-    }
-
-    /** The cached headless engine is not MainActivity's engine.  It therefore
-     * needs the same native call channel, otherwise cleanup/activation throws
-     * MissingPluginException after Telecom ANSWERED. */
-    private fun installNativeCallChannel(engine: FlutterEngine) {
-        MethodChannel(engine.dartExecutor.binaryMessenger, CALL_CHANNEL)
-            .setMethodCallHandler { call, result ->
-                val callId = call.argument<String>("callId").orEmpty().trim()
-                when (call.method) {
-                    "disconnectTelecomCall" -> {
-                        CallConnectionService.disconnectCall(callId, notifyFlutter = false)
-                        result.success(true)
-                    }
-                    "activateTelecomCall" -> result.success(CallConnectionService.activateCall(callId))
-                    "failTelecomCall" -> result.success(CallConnectionService.failCall(callId))
-                    else -> result.notImplemented()
-                }
-            }
     }
 
     private fun enqueueAction(
@@ -132,7 +181,7 @@ class TelecomCallActionReceiver : BroadcastReceiver() {
     private fun dispatchMuteToFlutter(context: Context, callId: String, isMuted: Boolean) {
         val engine = FlutterEngineCache.getInstance().get(ENGINE_ID)
         if (engine == null) {
-            startBackgroundFlutter(context)
+            ensureBackgroundFlutter(context)
             return
         }
         MethodChannel(engine.dartExecutor.binaryMessenger, EVENTS_CHANNEL)

@@ -5,6 +5,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:uuid/uuid.dart';
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -21,6 +22,72 @@ import 'package:shared_preferences/shared_preferences.dart';
 const MethodChannel _telecomChannel = MethodChannel('cn_call/call');
 const MethodChannel _telecomEventsChannel =
     MethodChannel('cn_call/telecom_events');
+
+Future<void> _announceCoreTelecomFlutterReady() async {
+  try {
+    await _telecomChannel.invokeMethod(
+      'coreTelecomFlutterReady',
+    );
+
+    print(
+      '[CN CALL][CORE TELECOM] Flutter ready announced',
+    );
+  } catch (e) {
+    print(
+      '[CN CALL][CORE TELECOM] Flutter ready handshake failed: $e',
+    );
+  }
+}
+
+Future<void> _handleCoreTelecomAction(
+  Map<Object?, Object?> arguments,
+) async {
+  final action = arguments['action']?.toString().trim() ?? '';
+  final callId = arguments['callId']?.toString().trim() ?? '';
+  final peerId = arguments['peerId']?.toString().trim() ?? '';
+
+  if (action.isEmpty || callId.isEmpty || peerId.isEmpty) {
+    print(
+      '[CN CALL][CORE TELECOM] '
+      'ignored Flutter event with incomplete identity',
+    );
+    return;
+  }
+
+  print(
+    '[CN CALL][CORE TELECOM][FLUTTER EVENT] '
+    'action=$action call_id=$callId peer_id=$peerId',
+  );
+
+  switch (action) {
+    case 'accept':
+      await RtcCallManager.instance.acceptCall(
+        callerId: peerId,
+        callId: callId,
+      );
+      break;
+
+    case 'reject':
+      await RtcCallManager.instance.rejectCall(
+        callerId: peerId,
+        callId: callId,
+      );
+      break;
+
+    case 'ended':
+      await RtcCallManager.instance.endFromTelecom(
+        callId: callId,
+        reason: 'ended',
+      );
+      break;
+
+    default:
+      print(
+        '[CN CALL][CORE TELECOM] '
+        'unknown Flutter action=$action call_id=$callId',
+      );
+  }
+}
 
 Future<void> _handleTelecomAction(Map<Object?, Object?> arguments) async {
   final action = arguments['action']?.toString() ?? '';
@@ -62,7 +129,15 @@ void _installTelecomEventHandler() {
       }
       return;
     }
-    if (call.method == 'callAction') await _handleTelecomAction(arguments);
+    if (call.method == 'callAction') {
+      await _handleTelecomAction(arguments);
+      return;
+    }
+
+    if (call.method == 'coreTelecomAction') {
+      await _handleCoreTelecomAction(arguments);
+      return;
+    }
   });
 }
 
@@ -95,6 +170,8 @@ Future<void> telecomBackgroundMain() async {
       print('[CN CALL][TELECOM] background session restore failed');
       return;
     }
+
+    await _announceCoreTelecomFlutterReady();
 
     final prefs = await SharedPreferences.getInstance();
     final queued = prefs.getString('flutter.cn_call_telecom_actions_v1') ?? '[]';
@@ -182,6 +259,12 @@ Future<void> main() async {
   await FirebaseMessagingService.instance.initialize();
 
   _installTelecomEventHandler();
+
+  /*
+   * Tell the native Core-Telecom dispatcher that this foreground
+   * Flutter engine is ready to receive call lifecycle events.
+   */
+  await _announceCoreTelecomFlutterReady();
 
   RtcCallManager.instance.startListening();
 
@@ -854,19 +937,52 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    final callId = const Uuid().v4();
+
     final started = await _telecomChannel.invokeMethod<bool>(
           'placeOutgoingTelecomCall',
-          <String, dynamic>{'targetId': id},
+          <String, dynamic>{
+            'targetId': id,
+            'callId': callId,
+            'targetName': name,
+          },
         ) ??
         false;
-    if (!started) {
+    print('[CN CALL][OUTGOING TELECOM RESULT] started=$started call_id=$callId');
+      if (!started) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('المستخدم غير متصل حاليًا')),
+        const SnackBar(content: Text('تعذر بدء المكالمة')),
       );
       return;
     }
 
+    final mediaStarted = await RtcCallManager.instance.startCall(
+      targetId: id,
+      callId: callId,
+    );
+
+    print('[CN CALL][MEDIA RESULT] started=$mediaStarted call_id=$callId');
+      if (!mediaStarted) {
+      /*
+       * Core-Telecom was created with this exact call_id, so terminate
+       * that same native call rather than leaving a dangling Telecom call.
+       */
+      try {
+        await _telecomChannel.invokeMethod(
+          'disconnectTelecomCall',
+          <String, dynamic>{'callId': callId},
+        );
+      } catch (e, st) {
+        print('[CN CALL][TELECOM] disconnectTelecomCall failed: $e\n$st');
+      }
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('تعذر بدء مسار الصوت')),
+      );
+      return;
+    }
   }
 
   @override
@@ -1388,6 +1504,18 @@ class _IncomingCallScreenState extends State<IncomingCallScreen> {
     await RtcCallManager.instance.acceptCall(
       callerId: widget.id,
       callId: widget.callId,
+    );
+
+    if (!context.mounted) return;
+
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CallScreen(
+          name: widget.name,
+          id: widget.id,
+        ),
+      ),
     );
   }
 

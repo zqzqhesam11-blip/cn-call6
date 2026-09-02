@@ -370,6 +370,10 @@ class RtcCallManager {
     currentCallId = suppliedCallId.isNotEmpty
         ? suppliedCallId
         : const Uuid().v4();
+
+    if (currentCallId == null || currentCallId!.isEmpty) {
+      return false;
+    }
     state = CallState.ringing;
     caller = true;
     inCall = false;
@@ -670,14 +674,63 @@ class RtcCallManager {
     }
   }
 
-  Future<void> endFromTelecom({required String callId, required String reason}) async {
-    if (!_isCurrentCall(callId)) {
-      await session.markCallEnded(callId);
-      await session.clearPendingIncomingCall(callId);
+  Future<void> endFromTelecom({
+    required String callId,
+    required String reason,
+  }) async {
+    final id = callId.trim();
+    if (id.isEmpty) return;
+
+    /*
+     * Telecom already confirmed the terminal state before dispatching
+     * this event. Flutter must only reconcile its own signaling/media
+     * state here. It must NOT send another Telecom disconnect request.
+     */
+    await session.markCallEnded(id);
+    await session.clearPendingIncomingCall(id);
+
+    if (!_isCurrentCall(id)) {
       return;
     }
-    await _cleanupCall(reason: reason);
+
+    if (_hangingUp) {
+      return;
+    }
+
+    _cancelCallTimeouts();
+    await _stopRinging();
+
+    try {
+      await livekit.disconnect();
+    } catch (error) {
+      print(
+        '[CN CALL][LIVEKIT] terminal disconnect failed '
+        'call_id=$id error=$error',
+      );
+    }
+
+    _pendingIceCandidates.clear();
+    remoteUserId = null;
+    currentCallId = null;
+    remoteOnline = null;
+    inCall = false;
+    caller = false;
+    state = switch (reason) {
+      'cancelled' => CallState.cancelled,
+      'rejected' => CallState.rejected,
+      'timeout' => CallState.timeout,
+      'failed' => CallState.ended,
+      _ => CallState.ended,
+    };
+
+    onDisconnected?.call();
+
+    print(
+      '[CN CALL][CALL TERMINAL RECONCILED] '
+      'call_id=$id reason=$reason',
+    );
   }
+
 
   Future<void> _failTelecomAndCleanup(String callId, {required String reason}) async {
     try {

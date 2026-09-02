@@ -1,6 +1,8 @@
 package com.example.mobile
 
 import android.content.Intent
+import kotlinx.coroutines.launch
+import androidx.lifecycle.lifecycleScope
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
@@ -20,9 +22,20 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Registration does not enable a managed account; the user does that
-        // in Phone accounts settings before Telecom can bind this service.
-        TelecomHelper.register(this)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(android.Manifest.permission.RECORD_AUDIO),
+                9100
+            )
+        }
+
+        // Register the VoIP app with Core-Telecom during app setup.
+        // Existing Telecom call code remains untouched for now.
+        CoreTelecomManager.register(this)
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -42,47 +55,126 @@ class MainActivity : FlutterActivity() {
                     "addIncomingTelecomCall" -> {
                         val callId = call.argument<String>("callId").orEmpty().trim()
                         val callerId = call.argument<String>("callerId").orEmpty().trim()
-                        val callerName = call.argument<String>("callerName").orEmpty().trim()
-                        result.success(
+                        val callerName =
+                            call.argument<String>("callerName").orEmpty().trim()
+
+                        if (callId.isEmpty() || callerId.isEmpty()) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+
+                        lifecycleScope.launch {
                             try {
-                                TelecomHelper.addIncomingCall(
-                                    this, callerId, callerName.ifEmpty { "CN CALL" }, callId
+                                CoreTelecomCallBridge.submitIncoming(
+                                    context = this@MainActivity,
+                                    callId = callId,
+                                    callerId = callerId,
+                                    callerName = callerName.ifEmpty { "CN CALL" },
                                 )
-                            } catch (error: SecurityException) {
-                                println("CN CALL Telecom: managed account is unavailable: $error")
-                                false
+                                result.success(true)
+                            } catch (error: Throwable) {
+                                println(
+                                    "[CN CALL][CORE TELECOM] " +
+                                        "incoming submit failed " +
+                                        "call_id=$callId error=$error"
+                                )
+                                result.success(false)
                             }
-                        )
+                        }
                     }
                     "placeOutgoingTelecomCall" -> {
-                        val targetId = call.argument<String>("targetId").orEmpty().trim()
-                        if (targetId.isEmpty()) {
+                        val targetId =
+                            call.argument<String>("targetId").orEmpty().trim()
+                        val callId =
+                            call.argument<String>("callId").orEmpty().trim()
+                        val targetName =
+                            call.argument<String>("targetName").orEmpty().trim()
+
+                        if (targetId.isEmpty() || callId.isEmpty()) {
                             result.success(false)
-                        } else if (hasPhoneAccountPermission() && hasCallPhonePermission()) {
-                            result.success(placeOutgoingTelecomCall(targetId))
-                        } else {
-                            pendingOutgoingTarget = targetId
-                            pendingOutgoingResult = result
-                            requestPhoneNumbersPermissionOrFail()
+                            return@setMethodCallHandler
+                        }
+
+                        lifecycleScope.launch {
+                            try {
+                                CoreTelecomCallBridge.submitOutgoing(
+                                    context = this@MainActivity,
+                                    callId = callId,
+                                    targetId = targetId,
+                                    targetName = targetName.ifEmpty { targetId },
+                                )
+
+                                result.success(true)
+                            } catch (error: Throwable) {
+                                println(
+                                    "[CN CALL][CORE TELECOM] " +
+                                        "outgoing submit failed " +
+                                        "call_id=$callId error=$error"
+                                )
+                                result.success(false)
+                            }
                         }
                     }
                     "disconnectTelecomCall" -> {
-                        val callId = call.argument<String>("callId").orEmpty().trim()
-                        if (callId.isEmpty()) result.success(false)
-                        else {
-                            CallConnectionService.disconnectCall(callId, notifyFlutter = false)
-                            result.success(true)
+                        val callId =
+                            call.argument<String>("callId").orEmpty().trim()
+
+                        if (callId.isEmpty()) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+
+                        lifecycleScope.launch {
+                            result.success(
+                                CoreTelecomCallBridge.disconnectCall(
+                                    callId = callId,
+                                    reason = "ended",
+                                )
+                            )
                         }
                     }
+
                     "activateTelecomCall" -> {
-                        result.success(CallConnectionService.activateCall(
+                        val callId =
                             call.argument<String>("callId").orEmpty().trim()
-                        ))
+
+                        if (callId.isEmpty()) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+
+                        lifecycleScope.launch {
+                            result.success(
+                                CoreTelecomCallBridge.activateCall(callId)
+                            )
+                        }
                     }
+
                     "failTelecomCall" -> {
-                        result.success(CallConnectionService.failCall(
+                        val callId =
                             call.argument<String>("callId").orEmpty().trim()
-                        ))
+
+                        if (callId.isEmpty()) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+
+                        lifecycleScope.launch {
+                            result.success(
+                                CoreTelecomCallBridge.disconnectCall(
+                                    callId = callId,
+                                    reason = "failed",
+                                )
+                            )
+                        }
+                    }
+
+                    "coreTelecomFlutterReady" -> {
+                        CoreTelecomFlutterDispatcher.markFlutterReady(
+                            context = this@MainActivity,
+                            engine = flutterEngine,
+                        )
+                        result.success(true)
                     }
                     else -> result.notImplemented()
                 }
@@ -137,7 +229,7 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun placeOutgoingTelecomCall(targetId: String): Boolean {
-        TelecomHelper.register(this)
+        CoreTelecomManager.register(this)
         if (!hasPhoneAccountPermission()) return false
         val manager = getSystemService(TELECOM_SERVICE) as TelecomManager
         val account = TelecomHelper.getHandle(this)
@@ -147,7 +239,7 @@ class MainActivity : FlutterActivity() {
             return false
         }
         return try {
-            manager.placeCall(Uri.fromParts("tel", targetId, null), Bundle().apply {
+            manager.placeCall(Uri.fromParts("cncall", targetId, null), Bundle().apply {
                 putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
             })
             true

@@ -4,27 +4,71 @@ import org.json.JSONArray
 import org.json.JSONObject
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class CallFirebaseService : FirebaseMessagingService() {
+
+    private val serviceScope =
+        CoroutineScope(Dispatchers.Default)
 
     override fun onMessageReceived(message: RemoteMessage) {
 
         val type = message.data["type"]
 
-            if (type == "call_cancelled" || type == "call_reject" || type == "hangup" || type == "timeout" || type == "disconnected") {
-                val callId = message.data["call_id"] ?: return
+        if (
+            type == "call_cancelled" ||
+            type == "call_reject" ||
+            type == "hangup" ||
+            type == "timeout" ||
+            type == "disconnected"
+        ) {
+            val callId =
+                message.data["call_id"]
+                    ?.trim()
+                    .orEmpty()
 
-                CallConnectionService.disconnectCall(callId)
+            if (callId.isEmpty()) return
 
-                markCallEnded(callId)
+            /*
+             * Remote terminal FCM must use the same Core-Telecom owner
+             * as every other terminal event.
+             *
+             * Never call CallConnectionService here. It is rollback-only.
+             */
+            serviceScope.launch {
+                  try {
+                      CoreTelecomCallBridge.disconnectCall(
+                          callId = callId,
+                          reason = when (type) {
+                              "call_reject" -> "rejected"
+                              "timeout" -> "timeout"
+                              "call_cancelled" -> "cancelled"
+                              "disconnected" -> "remote"
+                              else -> "remote"
+                          },
+                      )
 
-                println(
-                    "CN CALL Telecom: FCM terminal event handled " +
-                        "type=$type callId=$callId"
-                )
+                      markCallEnded(callId)
 
-                return
-            }
+                      println(
+                          "[CN CALL][CORE TELECOM] " +
+                              "FCM TERMINAL HANDLED " +
+                              "type=$type call_id=$callId"
+                      )
+
+                  } catch (error: Throwable) {
+                      println(
+                          "[CN CALL][CORE TELECOM] " +
+                              "FCM TERMINAL FAILED " +
+                              "type=$type call_id=$callId error=$error"
+                      )
+                  }
+              }
+
+return
+        }
 
         if (type != "incoming_call") {
             return
@@ -50,34 +94,47 @@ class CallFirebaseService : FirebaseMessagingService() {
             return
         }
 
-        // System-managed ConnectionService is the only incoming-call path.
+        /*
+         * FCM can wake the process while the Flutter application is fully
+         * terminated. Core-Telecom must therefore be able to create the
+         * incoming system call directly from this Firebase service.
+         *
+         * Do NOT route this path through TelecomHelper/ConnectionService.
+         */
         try {
-            val submitted = TelecomHelper.addIncomingCall(
+            CoreTelecomManager.register(this)
+
+            CoreTelecomCallBridge.submitIncoming(
                 context = this,
+                callId = callId,
                 callerId = callerId,
                 callerName = callerName,
-                callId = callId,
             )
 
-            if (submitted) {
-                // Keep native FCM and Flutter on the same per-call guard. This
-                // prevents a second incoming call from replacing the Samsung
-                // InCallUI call while Flutter is terminated.
-                getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
-                    .edit()
-                    .putString("flutter.cn_call_active_call_id", callId)
-                    .putLong("flutter.cn_call_active_call_at", System.currentTimeMillis())
-                    .apply()
-            }
+            getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
+                .edit()
+                .putString(
+                    "flutter.cn_call_active_call_id",
+                    callId,
+                )
+                .putLong(
+                    "flutter.cn_call_active_call_at",
+                    System.currentTimeMillis(),
+                )
+                .apply()
 
-            println("[CN CALL][CALL UI RINGING] submitted=$submitted call_id=$callId callerId=$callerId")
-            return
+            println(
+                "[CN CALL][CORE TELECOM][FCM INCOMING SUBMITTED] " +
+                    "call_id=$callId callerId=$callerId"
+            )
         } catch (e: Exception) {
             println(
-                "CN CALL Telecom: incoming call failed. " +
-                    "error=$e"
+                "[CN CALL][CORE TELECOM][FCM INCOMING FAILED] " +
+                    "call_id=$callId error=$e"
             )
         }
+
+        return
     }
 
     private fun isCallEnded(callId: String): Boolean {
