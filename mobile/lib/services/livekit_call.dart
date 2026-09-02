@@ -1,6 +1,7 @@
 // ignore_for_file: avoid_print
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:flutter/services.dart';
 import 'package:livekit_client/livekit_client.dart';
 
 class LiveKitCall {
@@ -15,9 +16,8 @@ class LiveKitCall {
     required String url,
     required String token,
   }) async {
-    // Keep LiveKit's normal audio-session handling.  This is a managed
-    // Telecom call, but externalCallSystem is not a substitute for verifying
-    // that capture/publication actually succeeded.
+    // Keep LiveKit's normal audio-session handling. CN CALL owns the call
+    // state and controls; Android Telecom is not part of this media path.
 
     _room = Room(
       roomOptions: const RoomOptions(
@@ -51,8 +51,17 @@ class LiveKitCall {
 
     print('[CN CALL][LIVEKIT CONNECT START]');
 
-    // Match the proven WebRTC call audio setup.
-    // Telecom remains the owner of the managed call state/routing.
+    // Configure Android's communication mode and audio focus explicitly.
+    // CN CALL owns routing: earpiece is default, speaker is opt-in.
+    const callChannel = MethodChannel('cn_call/call');
+    try {
+      await callChannel.invokeMethod(
+        'configureCallAudio',
+        <String, dynamic>{'speaker': false},
+      );
+    } catch (error) {
+      print('[CN CALL][AUDIO] native focus setup unavailable: $error');
+    }
     await Helper.setAndroidAudioConfiguration(
       AndroidAudioConfiguration.communication,
     );
@@ -69,8 +78,16 @@ class LiveKitCall {
   void notifyConnected() => onConnected?.call();
 
   Future<void> setSpeaker(bool value) async {
-    // Device routing belongs to Telecom/InCallUI for managed calls.
-    print('[CN CALL][LIVEKIT] ignored speaker request; Telecom owns routing');
+    try {
+      await const MethodChannel('cn_call/call').invokeMethod(
+        'configureCallAudio',
+        <String, dynamic>{'speaker': value},
+      );
+    } catch (error) {
+      print('[CN CALL][AUDIO] native route setup unavailable: $error');
+    }
+    await Helper.setSpeakerphoneOn(value);
+    print('[CN CALL][LIVEKIT] speaker=${value ? 'on' : 'off'}');
   }
 
   Future<void> mute(bool value) async {

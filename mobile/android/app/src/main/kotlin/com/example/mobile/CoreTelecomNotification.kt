@@ -11,12 +11,11 @@ import android.os.Build
 /**
  * Notification helper for Core-Telecom.
  *
- * This is intentionally independent from CallForegroundService for now.
- * It will become the single call notification once Core-Telecom is live.
+ * This is the single notification path for Core-Telecom calls.
  */
 object CoreTelecomNotification {
 
-    private const val CHANNEL_ID = "cn_call_core_telecom_calls"
+    const val CHANNEL_ID = "cn_call_core_telecom_calls"
 
 
     fun createChannel(context: Context) {
@@ -47,39 +46,20 @@ object CoreTelecomNotification {
 
         val appContext = context.applicationContext
 
-        val answerIntent = PendingIntent.getBroadcast(
+        val fullScreenIntent = PendingIntent.getActivity(
             appContext,
-            requestCode(callId, 1),
+            requestCode(callId, 0),
             Intent(
                 appContext,
-                CoreTelecomActionReceiver::class.java,
+                CNCallIncomingActivity::class.java,
             ).apply {
-                action = CoreTelecomActionReceiver.ACTION_ACCEPT
-                putExtra(CoreTelecomActionReceiver.EXTRA_CALL_ID, callId)
-                putExtra(CoreTelecomActionReceiver.EXTRA_PEER_ID, callerId)
-                putExtra(CoreTelecomActionReceiver.EXTRA_NAME, callerName)
+                putExtra("call_id", callId)
+                putExtra("caller_id", callerId)
+                putExtra("caller_name", callerName)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             },
             pendingIntentFlags(),
         )
-
-        val declineIntent = PendingIntent.getBroadcast(
-            appContext,
-            requestCode(callId, 2),
-            Intent(
-                appContext,
-                CoreTelecomActionReceiver::class.java,
-            ).apply {
-                action = CoreTelecomActionReceiver.ACTION_REJECT
-                putExtra(CoreTelecomActionReceiver.EXTRA_CALL_ID, callId)
-                putExtra(CoreTelecomActionReceiver.EXTRA_PEER_ID, callerId)
-                putExtra(CoreTelecomActionReceiver.EXTRA_NAME, callerName)
-            },
-            pendingIntentFlags(),
-        )
-
-        val person = android.app.Person.Builder()
-            .setName(callerName.ifBlank { callerId })
-            .build()
 
         val builder = Notification.Builder(
             appContext,
@@ -90,15 +70,23 @@ object CoreTelecomNotification {
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setOngoing(true)
             .setAutoCancel(false)
+            .setContentTitle(callerName.ifBlank { callerId })
+            .setContentText("مكالمة واردة عبر CN CALL")
+            .setPriority(Notification.PRIORITY_HIGH)
+            .setContentIntent(fullScreenIntent)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            builder.setStyle(
-                Notification.CallStyle.forIncomingCall(
-                    person,
-                    declineIntent,
-                    answerIntent,
-                )
-            )
+        // Android 14+ lets users revoke full-screen intent capability even
+        // when USE_FULL_SCREEN_INTENT is declared.  Keep the same CN CALL
+        // notification/content intent as the fallback; never route to the
+        // phone UI or MainActivity.
+        val canUseFullScreen =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
+                appContext.getSystemService(NotificationManager::class.java)
+                    .canUseFullScreenIntent()
+        if (canUseFullScreen) {
+            builder.setFullScreenIntent(fullScreenIntent, true)
+        } else {
+            println("[CN CALL][FULLSCREEN] unavailable; showing CN CALL heads-up notification call_id=$callId")
         }
 
         appContext
@@ -109,7 +97,7 @@ object CoreTelecomNotification {
             )
 
         println(
-            "[CN CALL][CORE TELECOM] INCOMING CALLSTYLE SHOWN " +
+            "[CN CALL][CORE TELECOM] INCOMING FULLSCREEN UI SHOWN " +
                 "call_id=$callId"
         )
     }
@@ -117,6 +105,7 @@ object CoreTelecomNotification {
     fun showOngoing(
         context: Context,
         callId: String,
+        peerId: String,
         remoteName: String,
     ) {
         createChannel(context)
@@ -134,15 +123,11 @@ object CoreTelecomNotification {
                 putExtra(CoreTelecomActionReceiver.EXTRA_CALL_ID, callId)
                 putExtra(
                     CoreTelecomActionReceiver.EXTRA_PEER_ID,
-                    remoteName,
+                    peerId,
                 )
             },
             pendingIntentFlags(),
         )
-
-        val person = android.app.Person.Builder()
-            .setName(remoteName)
-            .build()
 
         val builder = Notification.Builder(
             appContext,
@@ -154,14 +139,7 @@ object CoreTelecomNotification {
             .setOngoing(true)
             .setAutoCancel(false)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            builder.setStyle(
-                Notification.CallStyle.forOngoingCall(
-                    person,
-                    hangupIntent,
-                )
-            )
-        }
+        builder.addAction(Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel, "إنهاء", hangupIntent).build())
 
         appContext
             .getSystemService(NotificationManager::class.java)
@@ -171,7 +149,7 @@ object CoreTelecomNotification {
             )
 
         println(
-            "[CN CALL][CORE TELECOM] ONGOING CALLSTYLE SHOWN " +
+            "[CN CALL][CORE TELECOM] ONGOING NOTIFICATION SHOWN " +
                 "call_id=$callId"
         )
     }
@@ -194,6 +172,11 @@ object CoreTelecomNotification {
             .cancel(notificationId(callId, 2))
     }
 
+    fun cancelForCall(context: Context, callId: String) {
+        cancelIncoming(context, callId)
+        cancelOngoing(context, callId)
+    }
+
     fun cancelAll(context: Context) {
         val manager =
             context.applicationContext
@@ -213,6 +196,8 @@ object CoreTelecomNotification {
         value = (value % 1000000) * 10 + type
         return value
     }
+
+    fun ongoingNotificationId(callId: String): Int = notificationId(callId, 2)
 
     private fun requestCode(
         callId: String,

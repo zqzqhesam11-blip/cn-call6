@@ -1,0 +1,845 @@
+package com.example.mobile
+
+import android.content.Context
+import android.telecom.DisconnectCause
+import androidx.core.telecom.CallAttributesCompat
+import androidx.core.telecom.CallControlResult
+import androidx.core.telecom.CallControlScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Core-Telecom runtime bridge.
+ *
+ * This layer owns the Core-Telecom lifecycle but is NOT wired into the
+ * production FCM/outgoing path yet.
+ *
+ * Current responsibilities:
+ * - create incoming/outgoing Core-Telecom calls
+ * - retain their CallControlScope
+ * - serialize per-call actions
+ * - forward lifecycle callbacks to Flutter
+ */
+object CoreTelecomCallBridge {
+
+    private const val ACTION_QUEUE_KEY =
+        "flutter.cn_call_core_telecom_actions_v1"
+
+    private val worker =
+        CoroutineScope(
+            SupervisorJob() + Dispatchers.Default
+        )
+
+    private val actionLocks =
+        ConcurrentHashMap<String, Mutex>()
+
+    /**
+     * Experimental incoming entry point.
+     *
+     * Nothing in the current production code calls this yet.
+     */
+    fun submitIncoming(
+        context: Context,
+        callId: String,
+        callerId: String,
+        callerName: String,
+    ) {
+        submit(
+            context = context,
+            callId = callId,
+            peerId = callerId,
+            displayName = callerName,
+            incoming = true,
+        )
+    }
+
+    /**
+     * Experimental outgoing entry point.
+     *
+     * Nothing in the current production code calls this yet.
+     */
+    fun submitOutgoing(
+        context: Context,
+        callId: String,
+        targetId: String,
+        targetName: String = targetId,
+    ) {
+        submit(
+            context = context,
+            callId = callId,
+            peerId = targetId,
+            displayName = targetName,
+            incoming = false,
+        )
+    }
+
+    private fun submit(
+        context: Context,
+        callId: String,
+        peerId: String,
+        displayName: String,
+        incoming: Boolean,
+    ) {
+        val id = callId.trim()
+        val peer = peerId.trim()
+
+        if (id.isEmpty() || peer.isEmpty()) {
+            println(
+                "[CN CALL][CORE TELECOM] " +
+                    "CALL REJECTED: missing identity"
+            )
+            return
+        }
+
+        val runtime =
+            CoreTelecomCallRegistry.create(
+                callId = id,
+                peerId = peer,
+                displayName = displayName,
+                incoming = incoming,
+            )
+
+        if (runtime == null) {
+            println(
+                "[CN CALL][CORE TELECOM] " +
+                    "DUPLICATE CALL BLOCKED call_id=$id"
+            )
+            return
+        }
+
+        worker.launch {
+            try {
+                val attributes =
+                    if (incoming) {
+                        CoreTelecomManager.incomingAttributes(
+                            peer,
+                            displayName,
+                        )
+                    } else {
+                        CoreTelecomManager.outgoingAttributes(
+                            peer,
+                            displayName,
+                        )
+                    }
+
+                CoreTelecomManager.addCall(
+                    context = context,
+                    callId = id,
+                    attributes = attributes,
+                    onAnswer = { callType ->
+                        val runtime =
+                            CoreTelecomCallRegistry.get(id)
+
+                        if (runtime == null) {
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "ANSWER IGNORED: runtime missing " +
+                                    "call_id=$id"
+                            )
+                            return@addCall
+                        }
+
+                        if (!runtime.incoming) {
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "ANSWER IGNORED: not incoming " +
+                                    "call_id=$id"
+                            )
+                            return@addCall
+                        }
+
+                        if (runtime.state == CoreTelecomCallRegistry.State.ENDING ||
+                            runtime.state == CoreTelecomCallRegistry.State.ENDED ||
+                            runtime.state == CoreTelecomCallRegistry.State.ACTIVE ||
+                            runtime.state == CoreTelecomCallRegistry.State.ANSWERING
+                        ) {
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "ANSWER DUPLICATE BLOCKED " +
+                                    "call_id=$id state=${runtime.state}"
+                            )
+                            return@addCall
+                        }
+
+                        CoreTelecomCallRegistry.setState(
+                            id,
+                            CoreTelecomCallRegistry.State.ANSWERING,
+                        )
+
+                        println(
+                            "[CN CALL][CORE TELECOM] " +
+                                "ANSWER REQUEST " +
+                                "call_id=$id type=$callType"
+                        )
+
+                        CoreTelecomFlutterDispatcher.dispatch(
+                            context = context,
+                            action = "accept",
+                            callId = id,
+                            peerId = runtime.peerId,
+                            name = runtime.displayName,
+                        )
+
+                        println(
+                            "[CN CALL][CORE TELECOM] " +
+                                "ACCEPT FORWARDED TO FLUTTER " +
+                                "call_id=$id"
+                        )
+                    },
+                    onDisconnect = { cause ->
+                        val runtime =
+                            CoreTelecomCallRegistry.get(id)
+
+                        println(
+                            "[CN CALL][CORE TELECOM] " +
+                                "ON DISCONNECT " +
+                                "call_id=$id cause=$cause"
+                        )
+
+                        /*
+                         * Telecom has now confirmed the terminal transition.
+                         * This callback is the single native owner of final
+                         * registry cleanup.
+                         */
+                        if (runtime != null) {
+                            CoreTelecomCallRegistry.markEnded(id)
+
+                            CoreTelecomFlutterDispatcher.dispatch(
+                                context = context,
+                                action = "ended",
+                                callId = id,
+                                peerId = runtime.peerId,
+                                name = runtime.displayName,
+                            )
+
+                            CoreTelecomCallRegistry.remove(id)
+
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "RUNTIME REMOVED " +
+                                    "call_id=$id"
+                            )
+                        } else {
+                            /*
+                             * Duplicate/late Telecom callback.
+                             * Nothing else is allowed to resurrect or
+                             * recreate this call.
+                             */
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "LATE DISCONNECT IGNORED " +
+                                    "call_id=$id"
+                            )
+                        }
+                    },
+                    onSetActive = {
+                        CoreTelecomCallRegistry.setState(
+                            id,
+                            CoreTelecomCallRegistry.State.ACTIVE,
+                        )
+
+                        println(
+                            "[CN CALL][CORE TELECOM] " +
+                                "ACTIVE " +
+                                "call_id=$id"
+                        )
+                    },
+                    onSetInactive = {
+                        CoreTelecomCallRegistry.setState(
+                            id,
+                            CoreTelecomCallRegistry.State.INACTIVE,
+                        )
+
+                        println(
+                            "[CN CALL][CORE TELECOM] " +
+                                "INACTIVE " +
+                                "call_id=$id"
+                        )
+
+                        /*
+                         * Core-Telecom is asking the VoIP app to stop using
+                         * the microphone and incoming media here.
+                         *
+                         * LiveKit is not connected in this experimental
+                         * layer yet, so no media operation is performed.
+                         */
+                    },
+                    onScopeReady = { scope ->
+                        CoreTelecomCallRegistry.setScope(
+                            id,
+                            scope,
+                        )
+
+                        CoreTelecomCallRegistry.setState(
+                            id,
+                            if (incoming) {
+                                CoreTelecomCallRegistry.State.RINGING
+                            } else {
+                                CoreTelecomCallRegistry.State.DIALING
+                            },
+                        )
+
+                        println(
+                            "[CN CALL][CORE TELECOM] " +
+                                "SCOPE READY call_id=$id"
+                        )
+
+                        /*
+                         * A CallStyle action may have arrived before the
+                         * CallControlScope existed. Drain it now.
+                         */
+                        scope.launch {
+                            drainQueuedAction(
+                                context,
+                                id,
+                                scope,
+                            )
+                        }
+                    },
+                )
+            } catch (error: Throwable) {
+                println(
+                    "[CN CALL][CORE TELECOM] " +
+                        "ADD FAILED call_id=$id error=$error"
+                )
+
+                CoreTelecomCallRegistry.remove(id)
+            }
+        }
+    }
+
+    /**
+     * Activate one Core-Telecom call.
+     *
+     * This is the only native activation entry point used by Flutter.
+     */
+    suspend fun activateCall(
+        callId: String,
+    ): Boolean {
+        val id = callId.trim()
+        if (id.isEmpty()) return false
+
+        val runtime = CoreTelecomCallRegistry.get(id)
+            ?: return false
+
+        if (
+            runtime.state == CoreTelecomCallRegistry.State.ENDING ||
+            runtime.state == CoreTelecomCallRegistry.State.ENDED
+        ) {
+            println(
+                "[CN CALL][CORE TELECOM] " +
+                    "ACTIVATE BLOCKED terminal call_id=$id"
+            )
+            return false
+        }
+
+        val scope =
+            runtime.scope
+                ?: CoreTelecomCallRegistry.awaitScope(
+                    id,
+                    timeoutMs = 4500L,
+                )
+
+        if (scope == null) {
+            println(
+                "[CN CALL][CORE TELECOM] " +
+                    "ACTIVATE SCOPE TIMEOUT call_id=$id"
+            )
+            return false
+        }
+        return try {
+            val result = scope.setActive()
+
+            when (result) {
+                is CallControlResult.Success -> {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "ACTIVATE ACCEPTED call_id=$id"
+                    )
+                    true
+                }
+
+                is CallControlResult.Error -> {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "ACTIVATE ERROR call_id=$id " +
+                            "error=${result.errorCode}"
+                    )
+                    false
+                }
+            }
+        } catch (error: androidx.core.telecom.CallException) {
+            println(
+                "[CN CALL][CORE TELECOM] " +
+                    "ACTIVATE EXCEPTION call_id=$id code=${error.code}"
+            )
+            false
+        }
+    }
+
+    /**
+     * Disconnect one Core-Telecom call.
+     *
+     * The registry is NOT removed here. onDisconnect remains the sole
+     * terminal cleanup boundary.
+     */
+    suspend fun disconnectCall(
+        callId: String,
+        reason: String,
+    ): Boolean {
+        val id = callId.trim()
+        if (id.isEmpty()) return false
+
+        val runtime =
+            CoreTelecomCallRegistry.get(id)
+                ?: run {
+                    /*
+                     * Already removed means Telecom has already reached the
+                     * terminal boundary. Treat this as idempotent success.
+                     */
+                    return true
+                }
+
+        if (
+            runtime.state == CoreTelecomCallRegistry.State.ENDED
+        ) {
+            return true
+        }
+
+        /*
+         * Do not allow multiple terminal transactions for the same call.
+         * Only the first caller may claim ENDING.
+         */
+        if (!CoreTelecomCallRegistry.beginEnding(id)) {
+            println(
+                "[CN CALL][CORE TELECOM] " +
+                    "DISCONNECT DUPLICATE BLOCKED call_id=$id"
+            )
+            return true
+        }
+
+        /*
+         * The scope may race with the action/callback during cold start.
+         * Wait briefly instead of leaving the runtime permanently ENDING.
+         */
+        val scope =
+            runtime.scope
+                ?: CoreTelecomCallRegistry.awaitScope(
+                    id,
+                    timeoutMs = 4500L,
+                )
+
+        if (scope == null) {
+            println(
+                "[CN CALL][CORE TELECOM] " +
+                    "DISCONNECT SCOPE TIMEOUT call_id=$id"
+            )
+
+            /*
+             * Important:
+             * Do NOT remove the registry entry here.
+             * Do NOT mark ENDED here.
+             *
+             * The Telecom lifecycle remains authoritative through
+             * onDisconnect(). The runtime can still receive that callback.
+             */
+            return false
+        }
+
+        println(
+            "[CN CALL][CORE TELECOM] " +
+                "DISCONNECT START call_id=$id reason=$reason"
+        )
+
+        return try {
+            val result =
+                scope.disconnect(
+                    CoreTelecomManager.disconnectCause(reason)
+                )
+
+            when (result) {
+                is CallControlResult.Success -> {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "DISCONNECT REQUEST ACCEPTED " +
+                            "call_id=$id reason=$reason"
+                    )
+
+                    /*
+                     * Do not call markEnded().
+                     * Do not remove().
+                     *
+                     * onDisconnect() is the sole terminal boundary.
+                     */
+                    true
+                }
+
+                is CallControlResult.Error -> {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "DISCONNECT ERROR " +
+                            "call_id=$id " +
+                            "error=${result.errorCode}"
+                    )
+
+                    false
+                }
+            }
+        } catch (error: androidx.core.telecom.CallException) {
+            println(
+                "[CN CALL][CORE TELECOM] " +
+                    "DISCONNECT EXCEPTION " +
+                    "call_id=$id code=${error.code}"
+            )
+            false
+        }
+    }
+
+    /**
+     * Called by CoreTelecomActionReceiver after it queues an action.
+     *
+     * If the call scope is already available, the action is executed
+     * immediately. Otherwise it remains persisted until SCOPE READY.
+     */
+    fun onActionQueued(
+        context: Context,
+        callId: String,
+    ) {
+        val id = callId.trim()
+        if (id.isEmpty()) return
+
+        val scope =
+            CoreTelecomCallRegistry.getScope(id)
+                ?: return
+
+        worker.launch {
+            drainQueuedAction(
+                context,
+                id,
+                scope,
+            )
+        }
+    }
+
+    private suspend fun drainQueuedAction(
+        context: Context,
+        callId: String,
+        scope: CallControlScope,
+    ) {
+        val mutex =
+            actionLocks.computeIfAbsent(callId) {
+                Mutex()
+            }
+
+        mutex.withLock {
+            while (true) {
+                val action =
+                    peekQueuedAction(
+                        context,
+                        callId,
+                    ) ?: return
+
+                executeAction(
+                    context = context,
+                    callId = callId,
+                    scope = scope,
+                    action = action,
+                )
+
+                removeQueuedAction(
+                    context,
+                    callId,
+                    action.optString("action"),
+                )
+            }
+        }
+    }
+
+    private suspend fun executeAction(
+        context: Context,
+        callId: String,
+        scope: CallControlScope,
+        action: JSONObject,
+    ) {
+        /*
+         * Local alias used by legacy log/terminal references in this function.
+         * The outer submit() function uses "id"; executeAction() uses "callId".
+         */
+        val id = callId
+        when (action.optString("action")) {
+
+            "accept" -> {
+                val runtime =
+                    CoreTelecomCallRegistry.get(callId)
+                        ?: return
+
+                if (runtime.state == CoreTelecomCallRegistry.State.ENDING ||
+                    runtime.state == CoreTelecomCallRegistry.State.ENDED
+                ) {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "QUEUED ACCEPT BLOCKED: terminal " +
+                            "call_id=$callId state=${runtime.state}"
+                    )
+                    return
+                }
+
+                if (!runtime.incoming) {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "ACCEPT IGNORED: not incoming " +
+                            "call_id=$callId"
+                    )
+                    return
+                }
+
+                if (
+                    runtime.state == CoreTelecomCallRegistry.State.ENDING ||
+                    runtime.state == CoreTelecomCallRegistry.State.ENDED ||
+                    runtime.state == CoreTelecomCallRegistry.State.ACTIVE
+                ) {
+                    return
+                }
+
+                /*
+                 * The system onAnswer callback is the authoritative
+                 * indication that the user answered the incoming call.
+                 *
+                 * Do NOT call scope.answer() here again.
+                 */
+                CoreTelecomCallRegistry.setState(
+                    callId,
+                    CoreTelecomCallRegistry.State.ANSWERING,
+                )
+
+                CoreTelecomFlutterDispatcher.dispatch(
+                    context = context,
+                    action = "accept",
+                    callId = callId,
+                    peerId = runtime.peerId,
+                    name = runtime.displayName,
+                )
+
+                println(
+                    "[CN CALL][CORE TELECOM] " +
+                        "ACCEPT FORWARDED TO FLUTTER " +
+                        "call_id=$callId"
+                )
+            }
+
+                        "reject" -> {
+                val runtime =
+                    CoreTelecomCallRegistry.get(callId)
+                        ?: return
+
+                if (!runtime.incoming) {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "REJECT IGNORED: not incoming " +
+                            "call_id=$callId"
+                    )
+                    return
+                }
+
+                if (!CoreTelecomCallRegistry.beginEnding(callId)) {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "REJECT DUPLICATE/TERMINAL BLOCKED " +
+                            "call_id=$callId"
+                    )
+                    return
+                }
+
+                println(
+                    "[CN CALL][CORE TELECOM] " +
+                        "REJECT START call_id=$callId"
+                )
+
+                try {
+                    val result =
+                        scope.disconnect(
+                            CoreTelecomManager.disconnectCause("rejected")
+                        )
+
+                    when (result) {
+                        is CallControlResult.Success -> {
+                            CoreTelecomFlutterDispatcher.dispatch(
+                                context = context,
+                                action = "reject",
+                                callId = callId,
+                                peerId = runtime.peerId,
+                                name = runtime.displayName,
+                            )
+
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "REJECT REQUEST ACCEPTED " +
+                                    "call_id=$callId"
+                            )
+                        }
+
+                        is CallControlResult.Error -> {
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "REJECT ERROR " +
+                                    "call_id=$callId " +
+                                    "error=${result.errorCode}"
+                            )
+                        }
+                    }
+                } catch (error: androidx.core.telecom.CallException) {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "REJECT EXCEPTION " +
+                            "call_id=$callId code=${error.code}"
+                    )
+                }
+            }
+
+            "ended" -> {
+                val runtime =
+                    CoreTelecomCallRegistry.get(callId)
+                        ?: return
+
+                if (!CoreTelecomCallRegistry.beginEnding(callId)) {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "ENDED DUPLICATE/TERMINAL BLOCKED " +
+                            "call_id=$callId"
+                    )
+                    return
+                }
+
+                println(
+                    "[CN CALL][CORE TELECOM] " +
+                        "ENDED START call_id=$callId"
+                )
+
+                try {
+                    val result =
+                        scope.disconnect(
+                            CoreTelecomManager.disconnectCause("ended")
+                        )
+
+                    when (result) {
+                        is CallControlResult.Success -> {
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "END REQUEST ACCEPTED " +
+                                    "call_id=$callId"
+                            )
+                        }
+
+                        is CallControlResult.Error -> {
+                            println(
+                                "[CN CALL][CORE TELECOM] " +
+                                    "DISCONNECT ERROR " +
+                                    "call_id=$callId " +
+                                    "error=${result.errorCode}"
+                            )
+                        }
+                    }
+                } catch (error: androidx.core.telecom.CallException) {
+                    println(
+                        "[CN CALL][CORE TELECOM] " +
+                            "END EXCEPTION " +
+                            "call_id=$callId code=${error.code}"
+                    )
+                }
+            }
+        }
+    }
+
+    private fun peekQueuedAction(
+        context: Context,
+        callId: String,
+    ): JSONObject? {
+        val prefs =
+            context.getSharedPreferences(
+                "FlutterSharedPreferences",
+                Context.MODE_PRIVATE,
+            )
+
+        val queue =
+            try {
+                JSONArray(
+                    prefs.getString(
+                        ACTION_QUEUE_KEY,
+                        "[]",
+                    )
+                )
+            } catch (_: Exception) {
+                return null
+            }
+
+        for (index in 0 until queue.length()) {
+            val item =
+                queue.optJSONObject(index)
+                    ?: continue
+
+            if (
+                item.optString("callId").trim() ==
+                callId
+            ) {
+                return item
+            }
+        }
+
+        return null
+    }
+
+    private fun removeQueuedAction(
+        context: Context,
+        callId: String,
+        actionName: String,
+    ) {
+        val prefs =
+            context.getSharedPreferences(
+                "FlutterSharedPreferences",
+                Context.MODE_PRIVATE,
+            )
+
+        val queue =
+            try {
+                JSONArray(
+                    prefs.getString(
+                        ACTION_QUEUE_KEY,
+                        "[]",
+                    )
+                )
+            } catch (_: Exception) {
+                JSONArray()
+            }
+
+        val result = JSONArray()
+
+        for (index in 0 until queue.length()) {
+            val item =
+                queue.optJSONObject(index)
+
+            if (
+                item == null ||
+                item.optString("callId").trim() != callId ||
+                item.optString("action") != actionName
+            ) {
+                if (item != null) {
+                    result.put(item)
+                }
+            }
+        }
+
+        prefs.edit()
+            .putString(
+                ACTION_QUEUE_KEY,
+                result.toString(),
+            )
+            .apply()
+    }
+}

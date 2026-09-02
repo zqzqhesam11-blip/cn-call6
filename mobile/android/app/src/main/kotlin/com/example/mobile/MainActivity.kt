@@ -1,179 +1,80 @@
 package com.example.mobile
 
 import android.content.Intent
-import kotlinx.coroutines.launch
-import androidx.lifecycle.lifecycleScope
 import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Bundle
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.Ringtone
+import android.media.RingtoneManager
 import android.os.Build
-import android.telecom.TelecomManager
+import android.os.Bundle
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
+import org.json.JSONObject
 
+/** Hosts the Flutter-owned CN CALL UI; it never registers a Telecom call. */
 class MainActivity : FlutterActivity() {
-    private val channel = "cn_call/call"
-    private val readPhoneNumbersRequestCode = 9000
-    private val callPhoneRequestCode = 9001
-    private var pendingOutgoingTarget: String? = null
-    private var pendingOutgoingResult: MethodChannel.Result? = null
+    private var defaultRingtone: Ringtone? = null
+    private var audioManager: AudioManager? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
+    companion object {
+        const val ACTION_INCOMING_CALL = "com.example.mobile.action.INCOMING_CALL"
+        private const val EVENTS_CHANNEL = "cn_call/telecom_events"
+        private const val PREFERENCES = "FlutterSharedPreferences"
+        private const val PENDING_CALL_KEY = "flutter.pending_incoming_call"
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED
         ) {
-            requestPermissions(
-                arrayOf(android.Manifest.permission.RECORD_AUDIO),
-                9100
-            )
+            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 9100)
         }
+        persistIncomingIntent(intent)
+    }
 
-        // Register the VoIP app with Core-Telecom during app setup.
-        // Existing Telecom call code remains untouched for now.
-        CoreTelecomManager.register(this)
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (persistIncomingIntent(intent)) {
+            flutterEngine?.dartExecutor?.binaryMessenger?.let { messenger ->
+                MethodChannel(messenger, EVENTS_CHANNEL)
+                    .invokeMethod("incomingCall", incomingArguments(intent))
+            }
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        // Telecom actions must target this already-running Flutter isolate.
-        // Without this cache entry the receiver starts a second isolate, which
-        // logs in again and creates a competing WebSocket for the same user.
-        FlutterEngineCache.getInstance().put("cn_call_telecom_background_engine", flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channel)
+        // Keep Core Telecom available strictly as a lifecycle/event bridge.
+        // It never owns CN CALL's visual interface.
+        CoreTelecomManager.register(this)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cn_call/call")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
-                    "openTelecomSettings" -> {
-                        startActivity(Intent(TelecomManager.ACTION_CHANGE_PHONE_ACCOUNTS))
+                    "coreTelecomFlutterReady" -> {
+                        CoreTelecomFlutterDispatcher.markFlutterReady(this, flutterEngine)
                         result.success(true)
                     }
-                    "isTelecomAccountEnabled" -> result.success(TelecomHelper.isEnabled(this))
-                    "addIncomingTelecomCall" -> {
-                        val callId = call.argument<String>("callId").orEmpty().trim()
-                        val callerId = call.argument<String>("callerId").orEmpty().trim()
-                        val callerName =
-                            call.argument<String>("callerName").orEmpty().trim()
-
-                        if (callId.isEmpty() || callerId.isEmpty()) {
-                            result.success(false)
-                            return@setMethodCallHandler
-                        }
-
-                        lifecycleScope.launch {
-                            try {
-                                CoreTelecomCallBridge.submitIncoming(
-                                    context = this@MainActivity,
-                                    callId = callId,
-                                    callerId = callerId,
-                                    callerName = callerName.ifEmpty { "CN CALL" },
-                                )
-                                result.success(true)
-                            } catch (error: Throwable) {
-                                println(
-                                    "[CN CALL][CORE TELECOM] " +
-                                        "incoming submit failed " +
-                                        "call_id=$callId error=$error"
-                                )
-                                result.success(false)
-                            }
-                        }
+                    "startActiveCallForegroundService" -> result.success(CoreTelecomForegroundService.start(this, call.argument<String>("callId").orEmpty()))
+                    "configureCallAudio" -> {
+                        configureCallAudio(call.argument<Boolean>("speaker") == true)
+                        result.success(true)
                     }
-                    "placeOutgoingTelecomCall" -> {
-                        val targetId =
-                            call.argument<String>("targetId").orEmpty().trim()
-                        val callId =
-                            call.argument<String>("callId").orEmpty().trim()
-                        val targetName =
-                            call.argument<String>("targetName").orEmpty().trim()
-
-                        if (targetId.isEmpty() || callId.isEmpty()) {
-                            result.success(false)
-                            return@setMethodCallHandler
-                        }
-
-                        lifecycleScope.launch {
-                            try {
-                                CoreTelecomCallBridge.submitOutgoing(
-                                    context = this@MainActivity,
-                                    callId = callId,
-                                    targetId = targetId,
-                                    targetName = targetName.ifEmpty { targetId },
-                                )
-
-                                result.success(true)
-                            } catch (error: Throwable) {
-                                println(
-                                    "[CN CALL][CORE TELECOM] " +
-                                        "outgoing submit failed " +
-                                        "call_id=$callId error=$error"
-                                )
-                                result.success(false)
-                            }
-                        }
+                    "prepareRingbackAudio" -> {
+                          configureCallAudio(false)
+                          result.success(true)
+                      }
+                      "playDefaultRingtone" -> {
+                        playDefaultRingtone(call.argument<Boolean>("earpiece") == true)
+                        result.success(true)
                     }
-                    "disconnectTelecomCall" -> {
-                        val callId =
-                            call.argument<String>("callId").orEmpty().trim()
-
-                        if (callId.isEmpty()) {
-                            result.success(false)
-                            return@setMethodCallHandler
-                        }
-
-                        lifecycleScope.launch {
-                            result.success(
-                                CoreTelecomCallBridge.disconnectCall(
-                                    callId = callId,
-                                    reason = "ended",
-                                )
-                            )
-                        }
-                    }
-
-                    "activateTelecomCall" -> {
-                        val callId =
-                            call.argument<String>("callId").orEmpty().trim()
-
-                        if (callId.isEmpty()) {
-                            result.success(false)
-                            return@setMethodCallHandler
-                        }
-
-                        lifecycleScope.launch {
-                            result.success(
-                                CoreTelecomCallBridge.activateCall(callId)
-                            )
-                        }
-                    }
-
-                    "failTelecomCall" -> {
-                        val callId =
-                            call.argument<String>("callId").orEmpty().trim()
-
-                        if (callId.isEmpty()) {
-                            result.success(false)
-                            return@setMethodCallHandler
-                        }
-
-                        lifecycleScope.launch {
-                            result.success(
-                                CoreTelecomCallBridge.disconnectCall(
-                                    callId = callId,
-                                    reason = "failed",
-                                )
-                            )
-                        }
-                    }
-
-                    "coreTelecomFlutterReady" -> {
-                        CoreTelecomFlutterDispatcher.markFlutterReady(
-                            context = this@MainActivity,
-                            engine = flutterEngine,
-                        )
+                    "stopDefaultRingtone" -> {
+                        stopDefaultRingtone()
                         result.success(true)
                     }
                     else -> result.notImplemented()
@@ -181,71 +82,73 @@ class MainActivity : FlutterActivity() {
             }
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == readPhoneNumbersRequestCode) {
-            if (hasPhoneAccountPermission()) {
-                if (hasCallPhonePermission()) finishPendingOutgoing()
-                else requestPermissions(arrayOf(android.Manifest.permission.CALL_PHONE), callPhoneRequestCode)
-            } else {
-                finishPendingOutgoing()
-            }
-            return
-        }
-        if (requestCode != callPhoneRequestCode) return
-        finishPendingOutgoing()
+    private fun configureCallAudio(speaker: Boolean) {
+        val manager = getSystemService(AUDIO_SERVICE) as AudioManager
+        audioManager = manager
+        manager.mode = AudioManager.MODE_IN_COMMUNICATION
+        manager.isSpeakerphoneOn = speaker
+        val focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            .build()
+        audioFocusRequest = focus
+        manager.requestAudioFocus(focus)
     }
 
-    private fun finishPendingOutgoing() {
-        val targetId = pendingOutgoingTarget
-        val result = pendingOutgoingResult
-        pendingOutgoingTarget = null
-        pendingOutgoingResult = null
-        result?.success(targetId != null && hasPhoneAccountPermission() && hasCallPhonePermission() && placeOutgoingTelecomCall(targetId))
+    private fun playDefaultRingtone(earpiece: Boolean) {
+        stopDefaultRingtone()
+        configureCallAudio(speaker = !earpiece)
+        val uri = RingtoneManager.getActualDefaultRingtoneUri(
+            this,
+            RingtoneManager.TYPE_RINGTONE,
+        ) ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+        defaultRingtone = RingtoneManager.getRingtone(this, uri)
+        defaultRingtone?.apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) isLooping = true
+            audioAttributes = AudioAttributes.Builder()
+                .setUsage(
+                    if (earpiece) AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING
+                    else AudioAttributes.USAGE_NOTIFICATION_RINGTONE,
+                )
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            play()
+        }
     }
 
-    private fun hasCallPhonePermission(): Boolean =
-        Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
-            checkSelfPermission(android.Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
-
-    private fun hasPhoneAccountPermission(): Boolean = TelecomHelper.hasPhoneAccountPermission(this)
-
-    private fun requestPhoneNumbersPermissionOrFail() {
-        if (hasPhoneAccountPermission()) {
-            requestPermissions(arrayOf(android.Manifest.permission.CALL_PHONE), callPhoneRequestCode)
-            return
-        }
-        val prefs = getSharedPreferences("cn_call_permissions", MODE_PRIVATE)
-        if (prefs.getBoolean("read_phone_numbers_requested", false)) {
-            finishPendingOutgoing()
-            return
-        }
-        prefs.edit().putBoolean("read_phone_numbers_requested", true).apply()
-        requestPermissions(arrayOf(android.Manifest.permission.READ_PHONE_NUMBERS), readPhoneNumbersRequestCode)
+    private fun stopDefaultRingtone() {
+        defaultRingtone?.stop()
+        defaultRingtone = null
     }
 
-    private fun placeOutgoingTelecomCall(targetId: String): Boolean {
-        CoreTelecomManager.register(this)
-        if (!hasPhoneAccountPermission()) return false
-        val manager = getSystemService(TELECOM_SERVICE) as TelecomManager
-        val account = TelecomHelper.getHandle(this)
-        val enabled = try { manager.getPhoneAccount(account)?.isEnabled == true } catch (_: SecurityException) { false }
-        if (!enabled || !manager.isOutgoingCallPermitted(account)) {
-            println("CN CALL Telecom: managed account unavailable for outgoing call")
+    override fun onDestroy() {
+        stopDefaultRingtone()
+        audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+        audioManager?.mode = AudioManager.MODE_NORMAL
+        super.onDestroy()
+    }
+
+    private fun persistIncomingIntent(intent: Intent?): Boolean {
+        if (intent?.action != ACTION_INCOMING_CALL) return false
+        val data = incomingArguments(intent)
+        if (data["call_id"].isNullOrEmpty() || data["caller_id"].isNullOrEmpty()) {
             return false
         }
-        return try {
-            manager.placeCall(Uri.fromParts("cncall", targetId, null), Bundle().apply {
-                putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, account)
-            })
-            true
-        } catch (error: SecurityException) {
-            println("CN CALL Telecom: unable to place managed call: $error")
-            false
-        }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit()
+            .putString(PENDING_CALL_KEY, JSONObject(data).toString())
+            .apply()
+        return true
     }
+
+    private fun incomingArguments(intent: Intent): Map<String, String> = mapOf(
+        "type" to "incoming_call",
+        "call_id" to intent.getStringExtra("call_id").orEmpty(),
+        "caller_id" to intent.getStringExtra("caller_id").orEmpty(),
+        "caller_name" to intent.getStringExtra("caller_name").orEmpty(),
+        "from_id" to intent.getStringExtra("caller_id").orEmpty(),
+    )
 }

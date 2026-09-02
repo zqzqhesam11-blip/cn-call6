@@ -25,8 +25,7 @@ import java.util.concurrent.ConcurrentHashMap
  * - create incoming/outgoing Core-Telecom calls
  * - retain their CallControlScope
  * - serialize per-call actions
- * - consume queued CallStyle actions
- * - keep notifications synchronized with call lifecycle
+ * - forward lifecycle callbacks to Flutter
  */
 object CoreTelecomCallBridge {
 
@@ -113,6 +112,11 @@ object CoreTelecomCallBridge {
                     "DUPLICATE CALL BLOCKED call_id=$id"
             )
             return
+        }
+
+        CoreTelecomManager.register(context.applicationContext)
+        if (incoming) {
+            CoreTelecomNotification.showIncoming(context, id, displayName, peer)
         }
 
         worker.launch {
@@ -210,17 +214,10 @@ object CoreTelecomCallBridge {
                          * registry cleanup.
                          */
                         if (runtime != null) {
+                            CoreTelecomForegroundService.stop(context)
+                            CoreTelecomNotification.cancelForCall(context, id)
+                            context.sendBroadcast(android.content.Intent(CNCallIncomingActivity.ACTION_TERMINAL).setPackage(context.packageName))
                             CoreTelecomCallRegistry.markEnded(id)
-
-                            CoreTelecomNotification.cancelIncoming(
-                                context,
-                                id,
-                            )
-
-                            CoreTelecomNotification.cancelOngoing(
-                                context,
-                                id,
-                            )
 
                             CoreTelecomFlutterDispatcher.dispatch(
                                 context = context,
@@ -256,24 +253,19 @@ object CoreTelecomCallBridge {
                             CoreTelecomCallRegistry.State.ACTIVE,
                         )
 
-                        CoreTelecomNotification.cancelIncoming(context, id)
-
-                        CoreTelecomNotification.showOngoing(
-                            context = context,
-                            callId = id,
-                            remoteName =
-                                CoreTelecomCallRegistry
-                                    .get(id)
-                                    ?.displayName
-                                    .orEmpty()
-                                    .ifEmpty { peer },
-                        )
-
                         println(
                             "[CN CALL][CORE TELECOM] " +
                                 "ACTIVE " +
                                 "call_id=$id"
                         )
+                        CoreTelecomCallRegistry.get(id)?.let { active ->
+                            CoreTelecomNotification.showOngoing(
+                                context = context,
+                                callId = id,
+                                peerId = active.peerId,
+                                remoteName = active.displayName,
+                            )
+                        }
                     },
                     onSetInactive = {
                         CoreTelecomCallRegistry.setState(
@@ -310,28 +302,13 @@ object CoreTelecomCallBridge {
                             },
                         )
 
-                        if (incoming) {
-                            CoreTelecomNotification.showIncoming(
-                                context = context,
-                                callId = id,
-                                callerName = displayName,
-                                callerId = peer,
-                            )
-                        } else {
-                            CoreTelecomNotification.showOngoing(
-                                context = context,
-                                callId = id,
-                                remoteName = displayName.ifBlank { peer },
-                            )
-                        }
-
                         println(
                             "[CN CALL][CORE TELECOM] " +
                                 "SCOPE READY call_id=$id"
                         )
 
                         /*
-                         * A CallStyle action may have arrived before the
+                         * An action may have arrived before the
                          * CallControlScope existed. Drain it now.
                          */
                         scope.launch {
@@ -348,9 +325,6 @@ object CoreTelecomCallBridge {
                     "[CN CALL][CORE TELECOM] " +
                         "ADD FAILED call_id=$id error=$error"
                 )
-
-                CoreTelecomNotification.cancelIncoming(context, id)
-                CoreTelecomNotification.cancelOngoing(context, id)
 
                 CoreTelecomCallRegistry.remove(id)
             }
@@ -712,9 +686,6 @@ object CoreTelecomCallBridge {
 
                     when (result) {
                         is CallControlResult.Success -> {
-                            CoreTelecomNotification.cancelIncoming(context, id)
-                            CoreTelecomNotification.cancelOngoing(context, id)
-
                             CoreTelecomFlutterDispatcher.dispatch(
                                 context = context,
                                 action = "reject",
@@ -767,6 +738,18 @@ object CoreTelecomCallBridge {
                         "ENDED START call_id=$callId"
                 )
 
+                // The ongoing-notification End action must use the same
+                // Dart terminal owner that sends the remote hangup.  Native
+                // disconnect remains idempotent and onDisconnect remains the
+                // sole native cleanup boundary.
+                CoreTelecomFlutterDispatcher.dispatch(
+                    context = context,
+                    action = "hangup",
+                    callId = callId,
+                    peerId = runtime.peerId,
+                    name = runtime.displayName,
+                )
+
                 try {
                     val result =
                         scope.disconnect(
@@ -775,9 +758,6 @@ object CoreTelecomCallBridge {
 
                     when (result) {
                         is CallControlResult.Success -> {
-                            CoreTelecomNotification.cancelIncoming(context, id)
-                            CoreTelecomNotification.cancelOngoing(context, id)
-
                             println(
                                 "[CN CALL][CORE TELECOM] " +
                                     "END REQUEST ACCEPTED " +

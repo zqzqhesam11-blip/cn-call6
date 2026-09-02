@@ -38,13 +38,11 @@ Future<void> firebaseMessagingBackgroundHandler(
       return;
     }
 
-    await CallSession.instance.markCallActive(callId);
-
     await CallSession.instance.incomingCallFromNotification(message.data);
 
-    print(
-      'FCM BACKGROUND: incoming call UI is handled by Android Telecom',
-    );
+    // A background isolate cannot render UI. Persisting this exact payload
+    // lets the foreground Flutter activity consume it on launch/resume.
+    print('FCM BACKGROUND: incoming call persisted for CN CALL UI');
 
     return;
   }
@@ -140,11 +138,6 @@ class FirebaseMessagingService {
               message.data['from_id']?.toString() ??
               '';
 
-          final callerName =
-              message.data['caller_name']?.toString() ??
-              'CN CALL';
-          final targetId = message.data['target_id']?.toString() ?? '';
-
           if (callerId.isEmpty) return;
 
           final callId = message.data['call_id']?.toString();
@@ -152,14 +145,8 @@ class FirebaseMessagingService {
 
           if (await CallSession.instance.isCallEnded(callId)) return;
           if (await CallSession.instance.hasActiveCall()) return;
-          await CallSession.instance.markCallActive(callId);
-
-          if (CallSession.instance.socket.connected) return;
-
-          print(
-            'FCM FOREGROUND/BACKGROUND: incoming call UI is handled by Android Telecom. '
-            'caller=$callerName target=$targetId',
-          );
+          await CallSession.instance.incomingCallFromNotification(message.data);
+          print('FCM FOREGROUND: delivered to CN CALL incoming UI');
         },
       );
 

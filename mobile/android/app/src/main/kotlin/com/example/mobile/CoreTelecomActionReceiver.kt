@@ -7,10 +7,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Receives actions from Core-Telecom CallStyle notifications.
+ * Receives Core-Telecom lifecycle actions and forwards them to Flutter.
  *
- * This receiver intentionally does NOT call the legacy
- * CallConnectionService/TelecomHelper path.
+ * This receiver intentionally does NOT invoke a phone UI or the legacy
+ * It is the only broadcast action bridge for the Core-Telecom path.
  *
  * The Core-Telecom bridge will consume the queued action.
  */

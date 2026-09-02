@@ -1,5 +1,3 @@
-import 'package:flutter/foundation.dart';
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -16,6 +14,8 @@ import 'services/call_session.dart';
 import 'services/firebase_messaging_service.dart';
 import 'services/account_api.dart';
 import 'services/rtc_call_manager.dart';
+import 'screens/incoming_call_screen.dart';
+import 'screens/active_call_screen.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -74,6 +74,15 @@ Future<void> _handleCoreTelecomAction(
       );
       break;
 
+    case 'hangup':
+      // The active notification's End action converges on the same Dart
+      // terminal path as the custom active-call screen.
+      await RtcCallManager.instance.hangupForCall(
+        callId: callId,
+        peerId: peerId,
+      );
+      break;
+
     case 'ended':
       await RtcCallManager.instance.endFromTelecom(
         callId: callId,
@@ -122,6 +131,15 @@ Future<void> _handleTelecomAction(Map<Object?, Object?> arguments) async {
 void _installTelecomEventHandler() {
   _telecomEventsChannel.setMethodCallHandler((call) async {
     final arguments = Map<Object?, Object?>.from(call.arguments as Map);
+    // Android uses this event only to wake/bring the Flutter activity forward.
+    // Rendering and all call decisions remain in Flutter; it must never create
+    // a Telecom/InCallUI call.
+    if (call.method == 'incomingCall') {
+      await CallSession.instance.incomingCallFromNotification(
+        Map<String, dynamic>.from(arguments),
+      );
+      return;
+    }
     if (call.method == 'muteChanged') {
       final callId = arguments['callId']?.toString() ?? '';
       if (callId.isNotEmpty && RtcCallManager.instance.currentCallId == callId) {
@@ -140,16 +158,6 @@ void _installTelecomEventHandler() {
     }
   });
 }
-
-Future<void> openTelecomSettings() async {
-  try {
-    await _telecomChannel.invokeMethod('openTelecomSettings');
-  } on PlatformException catch (e) {
-    print('[CN CALL][TELECOM] settings failed: ${e.message}');
-  }
-}
-
-
 
 @pragma('vm:entry-point')
 Future<void> telecomBackgroundMain() async {
@@ -249,6 +257,75 @@ Future<void> telecomBackgroundMain() async {
   }
 }
 
+/// Entry point hosted only by CNCallIncomingActivity.  It deliberately avoids
+/// CNCallApp and the normal login/home navigation stack.
+@pragma('vm:entry-point')
+Future<void> incomingCallUiMain() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  _installTelecomEventHandler();
+  RtcCallManager.instance.startListening();
+
+  Map<Object?, Object?> bootstrap;
+  try {
+    bootstrap = Map<Object?, Object?>.from(
+      await _telecomChannel.invokeMethod<Map<Object?, Object?>>('incomingCallBootstrap') ?? const <Object?, Object?>{},
+    );
+  } on PlatformException {
+    runApp(const MaterialApp(home: SizedBox.shrink()));
+    return;
+  }
+  // These values come from CNCallIncomingActivity's launching Intent, not
+  // shared preferences.  That Intent is the sole cold-start UI handoff.
+  final callId = bootstrap['callId']?.toString().trim() ?? '';
+  final callerId = bootstrap['callerId']?.toString().trim() ?? '';
+  final callerName = bootstrap['callerName']?.toString() ?? 'مستخدم CN CALL';
+  if (callId.isEmpty || callerId.isEmpty || await CallSession.instance.isCallEnded(callId)) {
+    runApp(const MaterialApp(home: SizedBox.shrink()));
+    return;
+  }
+  if (!await CallSession.instance.restoreSession()) {
+    runApp(const MaterialApp(home: SizedBox.shrink()));
+    return;
+  }
+  await RtcCallManager.instance.prepareIncomingCall(callId: callId, callerId: callerId);
+  await RtcCallManager.instance.startIncomingRingtone();
+  runApp(MaterialApp(
+    debugShowCheckedModeBanner: false,
+    home: _DedicatedIncomingCallFlow(callId: callId, callerId: callerId, callerName: callerName),
+  ));
+}
+
+class _DedicatedIncomingCallFlow extends StatelessWidget {
+  final String callId;
+  final String callerId;
+  final String callerName;
+  const _DedicatedIncomingCallFlow({required this.callId, required this.callerId, required this.callerName});
+
+  @override
+  Widget build(BuildContext context) => IncomingCallScreen(
+    name: callerName, id: callerId, callId: callId,
+    onAccept: () async {
+      await RtcCallManager.instance.acceptCall(callerId: callerId, callId: callId, userInitiated: true);
+      if (!context.mounted) return;
+      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => ActiveCallScreen(
+        name: callerName, id: callerId,
+        onMute: RtcCallManager.instance.mute,
+        onSpeaker: RtcCallManager.instance.setSpeaker,
+        onEnd: () async {
+          await RtcCallManager.instance.hangup();
+          if (context.mounted) Navigator.of(context).pop();
+        },
+      )));
+    },
+    onReject: () async {
+      await RtcCallManager.instance.rejectCall(callerId: callerId, callId: callId);
+      if (context.mounted) Navigator.of(context).pop();
+    },
+    onMute: RtcCallManager.instance.mute,
+  );
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -259,12 +336,6 @@ Future<void> main() async {
   await FirebaseMessagingService.instance.initialize();
 
   _installTelecomEventHandler();
-
-  /*
-   * Tell the native Core-Telecom dispatcher that this foreground
-   * Flutter engine is ready to receive call lifecycle events.
-   */
-  await _announceCoreTelecomFlutterReady();
 
   RtcCallManager.instance.startListening();
 
@@ -628,51 +699,40 @@ class _HomeScreenState extends State<HomeScreen> {
       if (callerId.isEmpty) return;
       if (_incomingCallScreenOpen) return;
 
+      await RtcCallManager.instance.prepareIncomingCall(
+        callId: callId,
+        callerId: callerId,
+      );
+      await RtcCallManager.instance.startIncomingRingtone();
       _addHistory(name: callerName, id: callerId, incoming: true);
 
       _incomingCallScreenOpen = true;
       _incomingCallScreenCallId = callId;
 
-      if (kIsWeb) {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => IncomingCallScreen(
-              name: callerName,
-              id: callerId,
-              callId: callId,
-            ),
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => IncomingCallScreen(
+            name: callerName,
+            id: callerId,
+            callId: callId,
+            onAccept: () async {
+              await RtcCallManager.instance.acceptCall(callerId: callerId, callId: callId, userInitiated: true);
+              if (context.mounted) Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => CallScreen(name: callerName, id: callerId)));
+            },
+            onReject: () async {
+              await RtcCallManager.instance.rejectCall(callerId: callerId, callId: callId);
+              if (context.mounted) Navigator.of(context).pop();
+            },
+            onMute: RtcCallManager.instance.mute,
           ),
-        ).whenComplete(() {
-          if (mounted) {
-            _incomingCallScreenOpen = false;
-            _incomingCallScreenCallId = null;
-          }
-        });
-      } else {
-        bool telecomShown = false;
-
-        try {
-          telecomShown =
-              await _telecomChannel.invokeMethod<bool>(
-                'addIncomingTelecomCall',
-                <String, dynamic>{
-                  'callId': callId,
-                  'callerId': callerId,
-                  'callerName': callerName,
-                },
-              ) ??
-              false;
-        } catch (e) {
-          print('[CN CALL][TELECOM] incoming call failed: $e');
+        ),
+      ).whenComplete(() {
+        if (mounted) {
+          _incomingCallScreenOpen = false;
+          _incomingCallScreenCallId = null;
         }
-
-        if (!telecomShown) {
-          print(
-            '[CN CALL][TELECOM] incoming call was not accepted by Telecom',
-          );
-        }
-      }
+      });
     }
 
     // المكالمات القادمة مباشرة عبر WebSocket.
@@ -927,29 +987,14 @@ class _HomeScreenState extends State<HomeScreen> {
 
     await _addHistory(name: name, id: id, incoming: false);
 
-    if (kIsWeb) {
-      final started = await RtcCallManager.instance.startCall(targetId: id);
-      if (!started || !mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => CallScreen(name: name, id: id)),
-      );
-      return;
-    }
-
     final callId = const Uuid().v4();
+    final started = await RtcCallManager.instance.startCall(
+      targetId: id,
+      callId: callId,
+    );
 
-    final started = await _telecomChannel.invokeMethod<bool>(
-          'placeOutgoingTelecomCall',
-          <String, dynamic>{
-            'targetId': id,
-            'callId': callId,
-            'targetName': name,
-          },
-        ) ??
-        false;
-    print('[CN CALL][OUTGOING TELECOM RESULT] started=$started call_id=$callId');
-      if (!started) {
+    print('[CN CALL][OUTGOING SIGNAL RESULT] started=$started call_id=$callId');
+    if (!started) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('تعذر بدء المكالمة')),
@@ -957,32 +1002,11 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    final mediaStarted = await RtcCallManager.instance.startCall(
-      targetId: id,
-      callId: callId,
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => CallScreen(name: name, id: id)),
     );
-
-    print('[CN CALL][MEDIA RESULT] started=$mediaStarted call_id=$callId');
-      if (!mediaStarted) {
-      /*
-       * Core-Telecom was created with this exact call_id, so terminate
-       * that same native call rather than leaving a dangling Telecom call.
-       */
-      try {
-        await _telecomChannel.invokeMethod(
-          'disconnectTelecomCall',
-          <String, dynamic>{'callId': callId},
-        );
-      } catch (e, st) {
-        print('[CN CALL][TELECOM] disconnectTelecomCall failed: $e\n$st');
-      }
-
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('تعذر بدء مسار الصوت')),
-      );
-      return;
-    }
   }
 
   @override
@@ -1005,11 +1029,6 @@ class _HomeScreenState extends State<HomeScreen> {
             style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1.5),
           ),
           actions: [
-            IconButton(
-              tooltip: 'حسابات الاتصال',
-              onPressed: openTelecomSettings,
-              icon: const Icon(Icons.phone_in_talk),
-            ),
             IconButton(
               tooltip: 'تسجيل الخروج',
               onPressed: () async {
@@ -1471,240 +1490,6 @@ class _ContactItem extends StatelessWidget {
             icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class IncomingCallScreen extends StatefulWidget {
-  final String name;
-  final String id;
-  final String callId;
-
-  const IncomingCallScreen({
-    super.key,
-    required this.name,
-    required this.id,
-    required this.callId,
-  });
-
-  @override
-  State<IncomingCallScreen> createState() => _IncomingCallScreenState();
-}
-
-class _IncomingCallScreenState extends State<IncomingCallScreen> {
-  @override
-  void initState() {
-    super.initState();
-  }
-
-  Future<void> acceptCall(BuildContext context) async {
-    RtcCallManager.instance.startListening();
-
-    await RtcCallManager.instance.acceptCall(
-      callerId: widget.id,
-      callId: widget.callId,
-    );
-
-    if (!context.mounted) return;
-
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(
-        builder: (_) => CallScreen(
-          name: widget.name,
-          id: widget.id,
-        ),
-      ),
-    );
-  }
-
-  Future<void> rejectCall(BuildContext context) async {
-    RtcCallManager.instance.startListening();
-
-    if (context.mounted) {
-      Navigator.pop(context);
-    }
-
-    await RtcCallManager.instance.rejectCall(
-      callerId: widget.id,
-      callId: widget.callId,
-    );
-  }
-
-  @override
-  void dispose() {
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Directionality(
-      textDirection: TextDirection.rtl,
-      child: Scaffold(
-        backgroundColor: const Color(0xFF050505),
-        body: SafeArea(
-          child: Column(
-            children: [
-              const SizedBox(height: 50),
-
-              Text(
-                'مكالمة واردة',
-                style: TextStyle(
-                  color: Colors.grey.shade500,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-
-              const Spacer(),
-
-              Container(
-                width: 140,
-                height: 140,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: const Color(0xFF00E676).withValues(alpha: .08),
-                  border: Border.all(
-                    color: const Color(0xFF00E676).withValues(alpha: .35),
-                    width: 2,
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: const Color(0xFF00E676).withValues(alpha: .12),
-                      blurRadius: 40,
-                      spreadRadius: 10,
-                    ),
-                  ],
-                ),
-                child: const Icon(
-                  Icons.person,
-                  size: 68,
-                  color: Color(0xFF00E676),
-                ),
-              ),
-
-              const SizedBox(height: 28),
-
-              Text(
-                widget.name,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 28,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-
-              const SizedBox(height: 8),
-
-              Text(
-                'ID: ${widget.id}',
-                style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
-              ),
-
-              const SizedBox(height: 16),
-
-              Text(
-                'يتصل بك الآن...',
-                style: TextStyle(color: Colors.grey.shade500, fontSize: 14),
-              ),
-
-              const Spacer(),
-
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  Column(
-                    children: [
-                      GestureDetector(
-                        onTap: () => rejectCall(context),
-                        child: Container(
-                          width: 70,
-                          height: 70,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.red.shade700,
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.red.withValues(alpha: .20),
-                                blurRadius: 25,
-                                spreadRadius: 3,
-                              ),
-                            ],
-                          ),
-                          child: const Icon(
-                            Icons.call_end,
-                            color: Colors.white,
-                            size: 32,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        'رفض',
-                        style: TextStyle(
-                          color: Colors.grey.shade600,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-
-                  Column(
-                    children: [
-                      GestureDetector(
-                        onTap: () => acceptCall(context),
-                        child: Container(
-                          width: 70,
-                          height: 70,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: const Color(0xFF00C853),
-                            boxShadow: [
-                              BoxShadow(
-                                color: const Color(0xFF00E676)
-                                    .withValues(alpha: .22),
-                                blurRadius: 25,
-                                spreadRadius: 3,
-                              ),
-                            ],
-                          ),
-                          child: const Icon(
-                            Icons.call,
-                            color: Colors.white,
-                            size: 32,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        'قبول',
-                        style: TextStyle(
-                          color: Colors.grey.shade600,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-
-              const SizedBox(height: 55),
-
-              Text(
-                'CN CALL',
-                style: TextStyle(
-                  color: Colors.grey.shade800.withValues(alpha: .45),
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 2,
-                ),
-              ),
-
-              const SizedBox(height: 28),
-            ],
-          ),
-        ),
       ),
     );
   }

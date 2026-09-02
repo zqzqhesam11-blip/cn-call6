@@ -2,12 +2,13 @@
 
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async';
-import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/services.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 import 'package:uuid/uuid.dart';
 
 import 'call_session.dart';
+import 'call_coordinator.dart';
 import 'livekit_call.dart';
 import 'livekit_token_service.dart';
 
@@ -32,6 +33,7 @@ class RtcCallManager {
 
   final CallSession session = CallSession.instance;
   final LiveKitCall livekit = LiveKitCall();
+  final AudioPlayer _ringPlayer = AudioPlayer();
 
   Timer? _ringTimeoutTimer;
   Timer? _negotiationTimeoutTimer;
@@ -45,6 +47,7 @@ class RtcCallManager {
   CallState? state;
   bool inCall = false;
   bool caller = false;
+  bool _muted = false;
 
   final List<Map<String, dynamic>> _pendingIceCandidates = [];
 
@@ -57,8 +60,8 @@ class RtcCallManager {
   bool _started = false;
   bool _hangingUp = false;
   Future<void>? _cleanupFuture;
-  final AudioPlayer _ringbackPlayer = AudioPlayer();
   bool _ringbackPlaying = false;
+  bool _incomingRingtonePlaying = false;
   Completer<bool>? _callStartCompleter;
   int? _callStartExpiresAt;
 
@@ -88,15 +91,25 @@ class RtcCallManager {
     );
 
     try {
-      await _ringbackPlayer.stop();
-      await _ringbackPlayer.setReleaseMode(ReleaseMode.loop);
-      await _ringbackPlayer.play(
+      await _ringPlayer.setReleaseMode(ReleaseMode.loop);
+
+      await _ringPlayer.setAudioContext(
+        AudioContext(
+          android: AudioContextAndroid(
+            usageType: AndroidUsageType.voiceCommunication,
+            contentType: AndroidContentType.speech,
+            audioFocus: AndroidAudioFocus.gainTransient,
+          ),
+        ),
+      );
+
+      await _ringPlayer.play(
         AssetSource('sounds/ringing.mp3'),
       );
       _ringbackPlaying = true;
 
       print(
-        '[CN CALL][RINGBACK START] call_id=$callId asset=sounds/ringing.mp3',
+        '[CN CALL][RINGBACK START] call_id=$callId route=earpiece default_ringtone',
       );
     } catch (e) {
       _ringbackPlaying = false;
@@ -111,14 +124,18 @@ class RtcCallManager {
     _ringTimeoutTimer?.cancel();
     _ringTimeoutTimer = null;
 
-    if (_ringbackPlaying) {
+    if (_ringbackPlaying || _incomingRingtonePlaying) {
       try {
-        await _ringbackPlayer.stop();
+        await const MethodChannel('cn_call/call').invokeMethod(
+          'stopDefaultRingtone',
+        );
       } catch (e) {
         print('[CN CALL][RINGBACK STOP FAILED] error=$e');
       }
 
+      await _ringPlayer.stop();
       _ringbackPlaying = false;
+      _incomingRingtonePlaying = false;
       print('[CN CALL][RINGBACK STOP]');
     }
   }
@@ -251,6 +268,10 @@ class RtcCallManager {
           currentCallId != null) {
         return;
       }
+      if (CallCoordinator.instance.beginIncoming(messageCallId) !=
+          CallCommandResult.accepted) {
+        return;
+      }
       currentCallId = messageCallId;
       await session.markCallActive(messageCallId);
       state = CallState.incoming;
@@ -324,24 +345,6 @@ class RtcCallManager {
     await session.markCallEnded(id);
     await session.clearPendingIncomingCall(id);
 
-    try {
-      const telecomChannel = MethodChannel('cn_call/call');
-      await telecomChannel.invokeMethod(
-        'disconnectTelecomCall',
-        <String, dynamic>{
-          'callId': id,
-        },
-      );
-      print(
-        '[CN CALL][TELECOM] remote call disconnected '
-        'call_id=$id',
-      );
-    } catch (e) {
-      print(
-        '[CN CALL][TELECOM] remote disconnect failed: $e',
-      );
-    }
-
     if (reason == 'cancelled') {
       onRemoteCallCancelled?.call(id);
     }
@@ -353,6 +356,27 @@ class RtcCallManager {
 
   bool _isCurrentCall(String? callId) {
     return callId != null && callId.isNotEmpty && callId == currentCallId;
+  }
+
+  /// Hydrates the same call identity when FCM delivered the invite before the
+  /// WebSocket isolate was alive. This keeps ringtone cancellation and accept
+  /// on the single manager lifecycle.
+  Future<void> prepareIncomingCall({
+    required String callId,
+    required String callerId,
+  }) async {
+    if (callId.trim().isEmpty || callerId.trim().isEmpty) return;
+    if (currentCallId != null && currentCallId != callId) return;
+    if (!CallCoordinator.instance.owns(callId)) {
+      if (CallCoordinator.instance.beginIncoming(callId) !=
+          CallCommandResult.accepted) return;
+    }
+    currentCallId = callId;
+    remoteUserId = callerId;
+    caller = false;
+    inCall = false;
+    state = CallState.incoming;
+    await session.markCallActive(callId);
   }
 
   Future<bool> startCall({
@@ -400,7 +424,15 @@ class RtcCallManager {
     return true;
   }
 
-  Future<void> acceptCall({required String callerId, String? callId}) async {
+  Future<void> acceptCall({required String callerId, String? callId, bool userInitiated = false}) {
+    // Both custom UI and a late Core-Telecom answer callback pass through the
+    // coordinator queue.  Exactly one call_id may win beginAccept().
+    return CallCoordinator.instance.serialize(
+      () => _acceptCall(callerId: callerId, callId: callId, userInitiated: userInitiated),
+    );
+  }
+
+  Future<void> _acceptCall({required String callerId, String? callId, required bool userInitiated}) async {
     final acceptedCallId = callId ?? currentCallId;
     if (acceptedCallId == null ||
         await session.isCallEnded(acceptedCallId) ||
@@ -412,8 +444,25 @@ class RtcCallManager {
         state == CallState.connected) {
       return;
     }
+    if (!CallCoordinator.instance.owns(acceptedCallId) ||
+        CallCoordinator.instance.beginAccept(acceptedCallId) !=
+            CallCommandResult.accepted) {
+      return;
+    }
+
+    if (userInitiated) {
+      try {
+        await const MethodChannel('cn_call/call').invokeMethod(
+          'startActiveCallForegroundService',
+          <String, dynamic>{'callId': acceptedCallId},
+        );
+      } catch (error) {
+        print('[CN CALL][FGS] user-initiated start unavailable call_id=$acceptedCallId error=$error');
+      }
+    }
 
     print('[CN CALL][CALL ANSWER RECEIVED] call_id=$acceptedCallId');
+    await _stopRinging();
     remoteUserId = callerId;
     currentCallId = callId ?? currentCallId;
     await session.markCallActive(currentCallId!);
@@ -435,6 +484,7 @@ class RtcCallManager {
       });
       print('[CN CALL][CALL_ACCEPT SENT] call_id=$acceptedCallId');
       state = CallState.negotiating;
+      CallCoordinator.instance.beginNegotiation(acceptedCallId);
       _startNegotiationTimeout(acceptedCallId);
       _startConnectionTimeout(acceptedCallId);
       await _connectLiveKit(currentCallId!);
@@ -500,6 +550,26 @@ class RtcCallManager {
     );
   }
 
+  /// Rehydrates only an already-active Core-Telecom call so an ongoing
+  /// notification action can use the same hangup/cleanup implementation when
+  /// the dedicated UI isolate is not the engine receiving the action.
+  Future<void> hangupForCall({
+    required String callId,
+    required String peerId,
+  }) async {
+    final id = callId.trim();
+    final peer = peerId.trim();
+    if (id.isEmpty || peer.isEmpty || await session.isCallEnded(id)) return;
+    if (currentCallId != null && currentCallId != id) return;
+    currentCallId ??= id;
+    remoteUserId ??= peer;
+    caller = false;
+    inCall = true;
+    state = CallState.connected;
+    await session.markCallActive(id);
+    await hangup();
+  }
+
   Future<void> endForSession({bool sendSignal = true}) {
     return _cleanupCall(
       reason: 'ended',
@@ -548,15 +618,6 @@ class RtcCallManager {
       await livekit.disconnect();
 
       if (callId != null && callId.isNotEmpty) {
-        try {
-          const telecomChannel = MethodChannel('cn_call/call');
-          await telecomChannel.invokeMethod('disconnectTelecomCall', {'callId': callId});
-        } catch (error) {
-          print('[CN CALL][TELECOM] local disconnect failed: $error');
-        }
-      }
-
-      if (callId != null && callId.isNotEmpty) {
         final prefs = await SharedPreferences.getInstance();
 
         await prefs.setString(
@@ -578,6 +639,19 @@ class RtcCallManager {
 
       await session.markCallEnded(callId);
       await session.clearPendingIncomingCall(callId);
+      if (callId != null) CallCoordinator.instance.markEnded(callId);
+
+      if (callId != null && callId.isNotEmpty) {
+        try {
+          await const MethodChannel('cn_call/call').invokeMethod(
+            'disconnectTelecomCall',
+            <String, dynamic>{'callId': callId},
+          );
+        } catch (_) {
+          // The normal Flutter app and non-Android platforms have no native
+          // Core-Telecom call to terminate.
+        }
+      }
 
       _pendingIceCandidates.clear();
       remoteUserId = null;
@@ -585,6 +659,7 @@ class RtcCallManager {
       remoteOnline = null;
       inCall = false;
       caller = false;
+      _muted = false;
       state = switch (reason) {
         'cancelled' => CallState.cancelled,
         'rejected' => CallState.rejected,
@@ -604,8 +679,21 @@ class RtcCallManager {
     return cleanup;
   }
 
-  Future<void> mute(bool value) {
-    return livekit.mute(value);
+  Future<void> mute(bool value) async {
+    _muted = value;
+    await livekit.mute(value);
+  }
+
+  Future<void> startIncomingRingtone() async {
+    try {
+      await const MethodChannel('cn_call/call').invokeMethod(
+        'playDefaultRingtone',
+        <String, dynamic>{'earpiece': false},
+      );
+      _incomingRingtonePlaying = true;
+    } catch (error) {
+      print('[CN CALL][RINGTONE] start failed: $error');
+    }
   }
 
   Future<void> setSpeaker(bool value) {
@@ -640,6 +728,10 @@ class RtcCallManager {
     await livekit.connect(url: url, token: token);
     print('[CN CALL][LIVEKIT CONNECTED] call_id=$callId');
 
+    // Preserve a mute choice made on the incoming CN CALL screen while the
+    // LiveKit room was still connecting.
+    if (_muted) await livekit.mute(true);
+
     if (!_isCurrentCall(callId)) {
       await livekit.disconnect();
       throw StateError('LiveKit connected for a stale call');
@@ -656,22 +748,18 @@ class RtcCallManager {
       'cn_call_telecom_ended_call_id',
     );
 
-    print(
-      '[CN CALL][TELECOM] LiveKit connected call_id=$callId',
-    );
+    // Core-Telecom owns the native call lifecycle.  The Flutter UI remains
+    // CN CALL's custom UI; activation merely updates the native lifecycle.
     try {
-      const telecomChannel = MethodChannel('cn_call/call');
-      final activated = await telecomChannel.invokeMethod<bool>(
-            'activateTelecomCall',
-            {'callId': callId},
-          ) ??
-          false;
-      if (!activated) throw StateError('Telecom connection is unavailable');
-      livekit.notifyConnected();
-      print('[CN CALL][TELECOM ACTIVE] call_id=$callId');
+      await const MethodChannel('cn_call/call').invokeMethod(
+        'activateTelecomCall',
+        <String, dynamic>{'callId': callId},
+      );
     } catch (_) {
-      rethrow;
+      // Non-Android platforms and the regular foreground engine have no
+      // Core-Telecom runtime to activate.
     }
+    livekit.notifyConnected();
   }
 
   Future<void> endFromTelecom({
@@ -715,6 +803,7 @@ class RtcCallManager {
     remoteOnline = null;
     inCall = false;
     caller = false;
+    _muted = false;
     state = switch (reason) {
       'cancelled' => CallState.cancelled,
       'rejected' => CallState.rejected,
@@ -733,12 +822,6 @@ class RtcCallManager {
 
 
   Future<void> _failTelecomAndCleanup(String callId, {required String reason}) async {
-    try {
-      const telecomChannel = MethodChannel('cn_call/call');
-      await telecomChannel.invokeMethod('failTelecomCall', {'callId': callId});
-    } catch (error) {
-      print('[CN CALL][TELECOM] failure disconnect failed: $error');
-    }
     await _cleanupCall(reason: reason, sendSignal: true, signalType: 'hangup');
   }
 }

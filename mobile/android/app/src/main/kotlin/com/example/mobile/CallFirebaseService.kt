@@ -31,39 +31,23 @@ class CallFirebaseService : FirebaseMessagingService() {
 
             if (callId.isEmpty()) return
 
-            /*
-             * Remote terminal FCM must use the same Core-Telecom owner
-             * as every other terminal event.
-             *
-             * Never call CallConnectionService here. It is rollback-only.
-             */
+            // The native service only records a terminal tombstone. Flutter
+            // reconciles signalling/media when it is active; no Telecom call
+            // exists to disconnect here.
             serviceScope.launch {
                   try {
-                      CoreTelecomCallBridge.disconnectCall(
-                          callId = callId,
-                          reason = when (type) {
-                              "call_reject" -> "rejected"
-                              "timeout" -> "timeout"
-                              "call_cancelled" -> "cancelled"
-                              "disconnected" -> "remote"
-                              else -> "remote"
-                          },
-                      )
-
                       markCallEnded(callId)
+                      CoreTelecomCallBridge.disconnectCall(callId, type)
+                      sendBroadcast(Intent(CNCallIncomingActivity.ACTION_TERMINAL).setPackage(packageName))
 
                       println(
-                          "[CN CALL][CORE TELECOM] " +
+                          "[CN CALL][FCM] " +
                               "FCM TERMINAL HANDLED " +
                               "type=$type call_id=$callId"
                       )
 
                   } catch (error: Throwable) {
-                      println(
-                          "[CN CALL][CORE TELECOM] " +
-                              "FCM TERMINAL FAILED " +
-                              "type=$type call_id=$callId error=$error"
-                      )
+                      println("[CN CALL][FCM] terminal persistence failed call_id=$callId error=$error")
                   }
               }
 
@@ -94,44 +78,16 @@ return
             return
         }
 
-        /*
-         * FCM can wake the process while the Flutter application is fully
-         * terminated. Core-Telecom must therefore be able to create the
-         * incoming system call directly from this Firebase service.
-         *
-         * Do NOT route this path through TelecomHelper/ConnectionService.
-         */
+        // The full-screen PendingIntent is the single durable UI handoff: it
+        // carries this exact identity into CNCallIncomingActivity.  Do not
+        // mirror it into Flutter preferences, which could belong to an older
+        // call by the time the Activity starts.
         try {
-            CoreTelecomManager.register(this)
+            CoreTelecomCallBridge.submitIncoming(this@CallFirebaseService, callId, callerId, callerName)
 
-            CoreTelecomCallBridge.submitIncoming(
-                context = this,
-                callId = callId,
-                callerId = callerId,
-                callerName = callerName,
-            )
-
-            getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
-                .edit()
-                .putString(
-                    "flutter.cn_call_active_call_id",
-                    callId,
-                )
-                .putLong(
-                    "flutter.cn_call_active_call_at",
-                    System.currentTimeMillis(),
-                )
-                .apply()
-
-            println(
-                "[CN CALL][CORE TELECOM][FCM INCOMING SUBMITTED] " +
-                    "call_id=$callId callerId=$callerId"
-            )
+            println("[CN CALL][FCM] Flutter incoming launched call_id=$callId")
         } catch (e: Exception) {
-            println(
-                "[CN CALL][CORE TELECOM][FCM INCOMING FAILED] " +
-                    "call_id=$callId error=$e"
-            )
+            println("[CN CALL][FCM] incoming launch failed call_id=$callId error=$e")
         }
 
         return
@@ -143,6 +99,7 @@ return
     }
 
     private fun markCallEnded(callId: String) {
+        CoreTelecomNotification.cancelForCall(this, callId)
         val prefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
         val endedIds = endedCallIds(prefs).toMutableList()
         endedIds.remove(callId)
@@ -155,15 +112,11 @@ return
             "flutter.cn_call_ended_call_ids_v2",
             JSONArray(endedIds).toString()
         )
+        // This is not the cold-start UI handoff.  It only clears a matching
+        // Flutter-owned pending invite from an already-running app.
         val pending = prefs.getString("flutter.pending_incoming_call", null)
-        val pendingId = try {
-            JSONObject(pending ?: "{}").optString("call_id")
-        } catch (_: Exception) {
-            ""
-        }
-        if (pendingId == callId) {
-            editor.remove("flutter.pending_incoming_call")
-        }
+        val pendingId = try { JSONObject(pending ?: "{}").optString("call_id") } catch (_: Exception) { "" }
+        if (pendingId == callId) editor.remove("flutter.pending_incoming_call")
         if (prefs.getString("flutter.cn_call_active_call_id", null) == callId) {
             editor.remove("flutter.cn_call_active_call_id")
             editor.remove("flutter.cn_call_active_call_at")
@@ -181,4 +134,5 @@ return
             emptyList()
         }
     }
+
 }

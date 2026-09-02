@@ -21,8 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 object CoreTelecomFlutterDispatcher {
 
-    private const val ENGINE_ID =
-        "cn_call_telecom_background_engine"
+    private const val ENGINE_ID = BackgroundFlutterEngine.ENGINE_ID
 
     private const val EVENTS_CHANNEL =
         "cn_call/telecom_events"
@@ -91,7 +90,7 @@ object CoreTelecomFlutterDispatcher {
                 "action=$safeAction call_id=$id"
         )
 
-        TelecomCallActionReceiver.ensureCoreTelecomFlutter(context)
+        BackgroundFlutterEngine.ensureStarted(context)
     }
 
     fun markFlutterReady(
