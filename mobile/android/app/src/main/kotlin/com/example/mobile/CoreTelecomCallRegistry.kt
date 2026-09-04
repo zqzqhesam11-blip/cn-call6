@@ -36,6 +36,17 @@ object CoreTelecomCallRegistry {
     private val calls =
         ConcurrentHashMap<String, CallRuntime>()
 
+    private enum class TerminalCleanupState {
+        CLAIMED,
+        COMPLETED,
+    }
+
+    private val terminalCleanup =
+        ConcurrentHashMap<String, TerminalCleanupState>()
+
+    private val answerClaims =
+        ConcurrentHashMap<String, Boolean>()
+
     /*
      * One readiness gate per call_id.
      * activate/disconnect may arrive before Telecom enters the
@@ -198,8 +209,12 @@ object CoreTelecomCallRegistry {
      * Only the first caller that observes a non-terminal runtime may
      * transition it to ENDING. All later reject/hangup/end events are
      * rejected before they can call scope.disconnect().
+     *
+     * If force is true, ANSWERING state does not block the transition.
+     * This allows legitimate remote terminal events and answer failure
+     * cleanup to proceed even when answer ownership has been claimed.
      */
-    fun beginEnding(callId: String): Boolean {
+    fun beginEnding(callId: String, force: Boolean = false): Boolean {
         val id = callId.trim()
         if (id.isEmpty()) return false
 
@@ -210,12 +225,57 @@ object CoreTelecomCallRegistry {
                 null
             } else if (
                 runtime.state == State.ENDING ||
-                runtime.state == State.ENDED
+                runtime.state == State.ENDED ||
+                (!force && runtime.state == State.ANSWERING)
             ) {
                 runtime
             } else {
                 claimed = true
                 runtime.copy(state = State.ENDING)
+            }
+        }
+
+        return claimed
+    }
+
+    /**
+     * Checks if answer ownership has been claimed for a call.
+     * Read-only check; does not mutate state.
+     */
+    fun isAnswerClaimed(callId: String): Boolean {
+        val id = callId.trim()
+        if (id.isEmpty()) return false
+        return answerClaims.containsKey(id)
+    }
+
+    /**
+     * Atomically claims the answer transition for one incoming call.
+     *
+     * The runtime-keyed compute is serialized with beginEnding(), so an
+     * answer cannot claim a call while it is entering a terminal state.
+     */
+    fun tryClaimAnswer(callId: String): Boolean {
+        val id = callId.trim()
+        if (id.isEmpty()) return false
+
+        var claimed = false
+
+        calls.compute(id) { _, runtime ->
+            if (runtime == null) {
+                null
+            } else if (
+                !runtime.incoming ||
+                runtime.state == State.ENDING ||
+                runtime.state == State.ENDED
+            ) {
+                runtime
+            } else if (
+                answerClaims.putIfAbsent(id, true) != null
+            ) {
+                runtime
+            } else {
+                claimed = true
+                runtime.copy(state = State.ANSWERING)
             }
         }
 
@@ -244,6 +304,22 @@ object CoreTelecomCallRegistry {
         return updated
     }
 
+    fun claimTerminalCleanup(callId: String): Boolean {
+        val id = callId.trim()
+        if (id.isEmpty()) return false
+        return terminalCleanup.putIfAbsent(id, TerminalCleanupState.CLAIMED) == null
+    }
+
+    fun completeTerminalCleanup(callId: String): Boolean {
+        val id = callId.trim()
+        if (id.isEmpty()) return false
+        return terminalCleanup.replace(
+            id,
+            TerminalCleanupState.CLAIMED,
+            TerminalCleanupState.COMPLETED,
+        )
+    }
+
     fun remove(
         callId: String,
     ): CallRuntime? {
@@ -267,5 +343,7 @@ object CoreTelecomCallRegistry {
         calls.clear()
         scopeReady.values.forEach { it.cancel() }
         scopeReady.clear()
+        terminalCleanup.clear()
+        answerClaims.clear()
     }
 }

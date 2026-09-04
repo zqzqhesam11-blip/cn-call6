@@ -23,6 +23,9 @@ class CoreTelecomActionReceiver : BroadcastReceiver() {
         const val ACTION_DISCONNECT =
             "com.example.mobile.CORE_TELECOM_DISCONNECT"
 
+        const val ACTION_ANSWER =
+            "com.example.mobile.CORE_TELECOM_ANSWER"
+
         const val EXTRA_CALL_ID = "call_id"
         const val EXTRA_PEER_ID = "peer_id"
         const val EXTRA_NAME = "name"
@@ -40,6 +43,7 @@ class CoreTelecomActionReceiver : BroadcastReceiver() {
         val action = when (event.action) {
             ACTION_REJECT -> "reject"
             ACTION_DISCONNECT -> "ended"
+            ACTION_ANSWER -> "answer"
             else -> return
         }
 

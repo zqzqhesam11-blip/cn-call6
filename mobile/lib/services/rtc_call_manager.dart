@@ -177,6 +177,7 @@ class RtcCallManager {
       reason: 'timeout',
       sendSignal: true,
       signalType: 'hangup',
+      forceDisconnect: true,
     );
   }
 
@@ -192,6 +193,7 @@ class RtcCallManager {
       reason: 'timeout',
       sendSignal: true,
       signalType: 'hangup',
+      forceDisconnect: true,
     );
   }
 
@@ -204,6 +206,7 @@ class RtcCallManager {
       reason: 'timeout',
       sendSignal: true,
       signalType: 'call_cancelled',
+      forceDisconnect: true,
     );
   }
 
@@ -351,7 +354,10 @@ class RtcCallManager {
 
     if (!_isCurrentCall(id)) return;
 
-    await _cleanupCall(reason: reason);
+    await _cleanupCall(
+      reason: reason,
+      forceDisconnect: true,
+    );
   }
 
   bool _isCurrentCall(String? callId) {
@@ -409,7 +415,10 @@ class RtcCallManager {
     try {
       await session.ensureSocketReady();
     } catch (error) {
-      await _cleanupCall(reason: 'failed');
+      await _cleanupCall(
+        reason: 'failed',
+        forceDisconnect: true,
+      );
       return false;
     }
     _callStartCompleter = Completer<bool>();
@@ -484,6 +493,14 @@ class RtcCallManager {
       // socket used by outgoing calls. Never silently drop call_accept.
       await session.ensureSocketReady();
       if (!_isCurrentCall(acceptedCallId)) return;
+
+      // Re-check terminal state after socket wait; remote cancellation
+      // may have arrived during the wait.
+      if (await session.isCallEnded(acceptedCallId)) {
+        print('[CN CALL][ACCEPT] Call already ended remotely, aborting accept call_id=$acceptedCallId');
+        return;
+      }
+
       print('[CN CALL][CALL SOCKET READY] call_id=$acceptedCallId');
       await session.socket.sendGuaranteed({
         'type': 'call_accept',
@@ -546,6 +563,7 @@ class RtcCallManager {
       reason: 'rejected',
       sendSignal: true,
       signalType: 'call_reject',
+      forceDisconnect: false,
     );
   }
 
@@ -555,6 +573,7 @@ class RtcCallManager {
       reason: shouldCancel ? 'cancelled' : 'ended',
       sendSignal: sendSignal,
       signalType: shouldCancel ? 'call_cancelled' : 'hangup',
+      forceDisconnect: true,
     );
   }
 
@@ -583,6 +602,7 @@ class RtcCallManager {
       reason: 'ended',
       sendSignal: sendSignal,
       signalType: 'hangup',
+      forceDisconnect: true,
     );
   }
 
@@ -590,6 +610,7 @@ class RtcCallManager {
     required String reason,
     bool sendSignal = false,
     String? signalType,
+    bool forceDisconnect = false,
   }) async {
     if (_hangingUp) return _cleanupFuture ?? Future<void>.value();
 
@@ -598,7 +619,7 @@ class RtcCallManager {
     final target = remoteUserId;
 
     final cleanup = () async {
-      print('[CN CALL][CALL CLEANUP START] call_id=$callId reason=$reason');
+      print('[CN CALL][CALL CLEANUP START] call_id=$callId reason=$reason force=$forceDisconnect');
       try {
       _callStartCompleter?.complete(false);
       _callStartCompleter = null;
@@ -654,7 +675,7 @@ class RtcCallManager {
         try {
           await const MethodChannel('cn_call/call').invokeMethod(
             'disconnectTelecomCall',
-            <String, dynamic>{'callId': callId},
+            <String, dynamic>{'callId': callId, 'force': forceDisconnect},
           );
         } catch (_) {
           // The normal Flutter app and non-Android platforms have no native
@@ -849,6 +870,11 @@ class RtcCallManager {
 
 
   Future<void> _failTelecomAndCleanup(String callId, {required String reason}) async {
-    await _cleanupCall(reason: reason, sendSignal: true, signalType: 'hangup');
+    await _cleanupCall(
+      reason: reason,
+      sendSignal: true,
+      signalType: 'hangup',
+      forceDisconnect: true,
+    );
   }
 }

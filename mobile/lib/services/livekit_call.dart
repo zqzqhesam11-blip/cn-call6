@@ -65,7 +65,7 @@ class LiveKitCall {
     await Helper.setAndroidAudioConfiguration(
       AndroidAudioConfiguration.communication,
     );
-    await Helper.setSpeakerphoneOn(false);
+    await AudioManager.instance.setSpeakerOutputPreferred(false);
 
     await _room!.connect(url, token);
 
@@ -86,7 +86,7 @@ class LiveKitCall {
     } catch (error) {
       print('[CN CALL][AUDIO] native route setup unavailable: $error');
     }
-    await Helper.setSpeakerphoneOn(value);
+    await AudioManager.instance.setSpeakerOutputPreferred(value);
     print('[CN CALL][LIVEKIT] speaker=${value ? 'on' : 'off'}');
   }
 

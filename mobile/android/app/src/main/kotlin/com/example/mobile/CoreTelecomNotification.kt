@@ -61,6 +61,59 @@ object CoreTelecomNotification {
             pendingIntentFlags(),
         )
 
+        val answerIntent = PendingIntent.getBroadcast(
+            appContext,
+            requestCode(callId, 1),
+            Intent(
+                appContext,
+                CoreTelecomActionReceiver::class.java,
+            ).apply {
+                action = CoreTelecomActionReceiver.ACTION_ANSWER
+                putExtra(
+                    CoreTelecomActionReceiver.EXTRA_CALL_ID,
+                    callId,
+                )
+                putExtra(
+                    CoreTelecomActionReceiver.EXTRA_PEER_ID,
+                    callerId,
+                )
+                putExtra(
+                    CoreTelecomActionReceiver.EXTRA_NAME,
+                    callerName,
+                )
+            },
+            pendingIntentFlags(),
+        )
+
+        val declineIntent = PendingIntent.getBroadcast(
+            appContext,
+            requestCode(callId, 2),
+            Intent(
+                appContext,
+                CoreTelecomActionReceiver::class.java,
+            ).apply {
+                action = CoreTelecomActionReceiver.ACTION_REJECT
+                putExtra(
+                    CoreTelecomActionReceiver.EXTRA_CALL_ID,
+                    callId,
+                )
+                putExtra(
+                    CoreTelecomActionReceiver.EXTRA_PEER_ID,
+                    callerId,
+                )
+                putExtra(
+                    CoreTelecomActionReceiver.EXTRA_NAME,
+                    callerName,
+                )
+            },
+            pendingIntentFlags(),
+        )
+
+        val person =
+            android.app.Person.Builder()
+                .setName(callerName.ifBlank { callerId })
+                .build()
+
         val builder = Notification.Builder(
             appContext,
             CHANNEL_ID,
@@ -87,6 +140,19 @@ object CoreTelecomNotification {
             builder.setFullScreenIntent(fullScreenIntent, true)
         } else {
             println("[CN CALL][FULLSCREEN] unavailable; showing CN CALL heads-up notification call_id=$callId")
+        }
+
+        // Attach native CallStyle Answer/Decline actions.  They are broadcast
+        // only and never launch an Activity; the Full-Screen Intent above stays
+        // the sole CNCallIncomingActivity entry.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setStyle(
+                Notification.CallStyle.forIncomingCall(
+                    person,
+                    declineIntent,
+                    answerIntent,
+                ),
+            )
         }
 
         appContext

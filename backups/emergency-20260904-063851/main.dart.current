@@ -125,7 +125,7 @@ Future<void> _handleTelecomAction(Map<Object?, Object?> arguments) async {
     await RtcCallManager.instance.endFromTelecom(callId: callId, reason: 'ended');
   }
   final prefs = await SharedPreferences.getInstance();
-  final raw = prefs.getString('flutter.cn_call_core_telecom_actions_v1') ?? '[]';
+  final raw = prefs.getString('flutter.cn_call_telecom_actions_v1') ?? '[]';
   try {
     final queued = jsonDecode(raw);
     if (queued is List) {
@@ -193,7 +193,7 @@ Future<void> telecomBackgroundMain() async {
     await _announceCoreTelecomFlutterReady();
 
     final prefs = await SharedPreferences.getInstance();
-    final queued = prefs.getString('flutter.cn_call_core_telecom_actions_v1') ?? '[]';
+    final queued = prefs.getString('flutter.cn_call_telecom_actions_v1') ?? '[]';
     final actions = <Map<String, dynamic>>[];
     try {
       final decoded = jsonDecode(queued);
@@ -330,22 +330,7 @@ class _DedicatedIncomingCallFlow extends StatelessWidget {
         'claimCoreTelecomAnswer',
         <String, dynamic>{'callId': callId},
       ) ?? false;
-      if (!answerClaimed) {
-        // If claim failed, check if a native runtime exists.
-        // For cold-start (CNCallIncomingActivity), a native runtime SHOULD exist.
-        // If it exists and claim failed, another native path (onAnswer/CallStyle)
-        // already owns the answer - do not proceed.
-        final hasRuntime = await const MethodChannel('cn_call/call').invokeMethod<bool>(
-          'hasNativeRuntime',
-          <String, dynamic>{'callId': callId},
-        ) ?? false;
-        if (hasRuntime) {
-          print('[CN CALL][COLD START] Answer already claimed by native path, aborting Flutter accept call_id=$callId');
-          return;
-        }
-        // No native runtime (should not happen for cold start, but safe fallback): proceed.
-        print('[CN CALL][COLD START] No native runtime, proceeding with Flutter accept call_id=$callId');
-      }
+      if (!answerClaimed) return;
       await RtcCallManager.instance.acceptCall(callerId: callerId, callId: callId, userInitiated: true);
       if (!context.mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute(
@@ -754,6 +739,23 @@ class _HomeScreenState extends State<HomeScreen>
 
       if (callerId.isEmpty) return;
       if (_incomingCallScreenOpen) return;
+        try {
+          await const MethodChannel('cn_call/call').invokeMethod<bool>(
+            'submitIncoming',
+            <String, dynamic>{
+              'callId': callId,
+              'callerId': callerId,
+              'callerName': callerName,
+            },
+          );
+        } catch (error) {
+          print(
+            '[CN CALL][CORE TELECOM] '
+            'OPEN-APP SUBMIT INCOMING FAILED '
+            'call_id=$callId error=$error',
+          );
+        }
+
 
       await RtcCallManager.instance.prepareIncomingCall(
         callId: callId,
@@ -773,7 +775,7 @@ class _HomeScreenState extends State<HomeScreen>
             id: callerId,
             callId: callId,
             onAccept: () async {
-              final _ = await const MethodChannel('cn_call/call').invokeMethod<bool>(
+              final answerClaimed = await const MethodChannel('cn_call/call').invokeMethod<bool>(
                 'claimCoreTelecomAnswer',
                 <String, dynamic>{'callId': callId},
               ) ?? false;

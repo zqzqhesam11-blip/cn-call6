@@ -13,6 +13,7 @@ import androidx.core.app.ServiceCompat
 /** Execution support only for an active Core-Telecom call; it owns no call state. */
 class CoreTelecomForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        CoreTelecomNotification.createChannel(applicationContext)
         val callId = intent?.getStringExtra(EXTRA_CALL_ID).orEmpty()
         val notification = Notification.Builder(this, CoreTelecomNotification.CHANNEL_ID)
             .setSmallIcon(android.R.drawable.sym_call_outgoing)

@@ -66,8 +66,8 @@ object CoreTelecomCallBridge {
         callId: String,
         callerId: String,
         callerName: String,
-    ) {
-        submit(
+    ): Boolean {
+        return submit(
             context = context,
             callId = callId,
             peerId = callerId,
@@ -102,7 +102,7 @@ object CoreTelecomCallBridge {
         peerId: String,
         displayName: String,
         incoming: Boolean,
-    ) {
+    ): Boolean {
         val id = callId.trim()
         val peer = peerId.trim()
 
@@ -111,7 +111,7 @@ object CoreTelecomCallBridge {
                 "[CN CALL][CORE TELECOM] " +
                     "CALL REJECTED: missing identity"
             )
-            return
+            return false
         }
 
         val runtime =
@@ -127,7 +127,7 @@ object CoreTelecomCallBridge {
                 "[CN CALL][CORE TELECOM] " +
                     "DUPLICATE CALL BLOCKED call_id=$id"
             )
-            return
+            return false
         }
 
         CoreTelecomManager.register(context.applicationContext)
@@ -301,9 +301,14 @@ object CoreTelecomCallBridge {
                         "ADD FAILED call_id=$id error=$error"
                 )
 
-                CoreTelecomCallRegistry.remove(id)
+                finalizeTerminalCleanup(
+                    context = context.applicationContext,
+                    callId = id,
+                )
             }
         }
+
+        return true
     }
 
     /**
@@ -499,7 +504,6 @@ object CoreTelecomCallBridge {
     suspend fun disconnectCallResult(
         callId: String,
         reason: String,
-        force: Boolean = false,
     ): DisconnectResult {
         val id = callId.trim()
         if (id.isEmpty()) return DisconnectResult.EXCEPTION
@@ -521,24 +525,10 @@ object CoreTelecomCallBridge {
         }
 
         /*
-         * If answer ownership has been claimed, only forced terminal
-         * transitions (remote cancellation, answer failure) may proceed.
-         * User-initiated reject/decline must not steal an already-claimed answer.
-         */
-        if (!force && CoreTelecomCallRegistry.isAnswerClaimed(id)) {
-            println(
-                "[CN CALL][CORE TELECOM] " +
-                    "DISCONNECT BLOCKED: answer already claimed call_id=$id reason=$reason"
-            )
-            return DisconnectResult.DUPLICATE
-        }
-
-        /*
          * Do not allow multiple terminal transactions for the same call.
          * Only the first caller may claim ENDING.
-         * force=true allows ANSWERING -> ENDING for legitimate remote terminal.
          */
-        if (!CoreTelecomCallRegistry.beginEnding(id, force)) {
+        if (!CoreTelecomCallRegistry.beginEnding(id)) {
             println(
                 "[CN CALL][CORE TELECOM] " +
                     "DISCONNECT DUPLICATE BLOCKED call_id=$id"
@@ -631,9 +621,8 @@ object CoreTelecomCallBridge {
     suspend fun disconnectCall(
         callId: String,
         reason: String,
-        force: Boolean = false,
     ): Boolean {
-        val disconnectResult = disconnectCallResult(callId, reason, force)
+        val disconnectResult = disconnectCallResult(callId, reason)
         val booleanResult = when (disconnectResult) {
             DisconnectResult.SUCCESS,
             DisconnectResult.RUNTIME_MISSING,
@@ -769,20 +758,7 @@ object CoreTelecomCallBridge {
                     return
                 }
 
-                /*
-                 * If answer ownership has been claimed, a competing user
-                 * reject must not steal the call. Remote terminal and
-                 * answer failure use force=true in disconnectCallResult.
-                 */
-                if (CoreTelecomCallRegistry.isAnswerClaimed(callId)) {
-                    println(
-                        "[CN CALL][CORE TELECOM] " +
-                            "REJECT BLOCKED: answer already claimed call_id=$callId"
-                    )
-                    return
-                }
-
-                if (!CoreTelecomCallRegistry.beginEnding(callId, false)) {
+                if (!CoreTelecomCallRegistry.beginEnding(callId)) {
                     println(
                         "[CN CALL][CORE TELECOM] " +
                             "REJECT DUPLICATE/TERMINAL BLOCKED " +
@@ -854,12 +830,7 @@ object CoreTelecomCallBridge {
                     CoreTelecomCallRegistry.get(callId)
                         ?: return
 
-                /*
-                 * Ongoing notification End action is a legitimate terminal
-                 * transition that must proceed even if answer was claimed.
-                 * Use force=true to allow ANSWERING -> ENDING transition.
-                 */
-                if (!CoreTelecomCallRegistry.beginEnding(callId, true)) {
+                if (!CoreTelecomCallRegistry.beginEnding(callId)) {
                     println(
                         "[CN CALL][CORE TELECOM] " +
                             "ENDED DUPLICATE/TERMINAL BLOCKED " +
@@ -956,12 +927,6 @@ object CoreTelecomCallBridge {
         }
         recordAnswerRequested(context, id)
         return true
-    }
-
-    fun hasNativeRuntime(callId: String): Boolean {
-        val id = callId.trim()
-        if (id.isEmpty()) return false
-        return CoreTelecomCallRegistry.contains(id)
     }
 
     fun clearAnswerRequested(

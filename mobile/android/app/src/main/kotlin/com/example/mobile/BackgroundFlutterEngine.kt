@@ -25,12 +25,31 @@ object BackgroundFlutterEngine {
         MethodChannel(engine.dartExecutor.binaryMessenger, CALL_CHANNEL).setMethodCallHandler { call, result ->
             val callId = call.argument<String>("callId").orEmpty().trim()
             when (call.method) {
-                "disconnectTelecomCall", "failTelecomCall" -> CoroutineScope(Dispatchers.Default).launch {
-                    result.success(CoreTelecomCallBridge.disconnectCall(callId, if (call.method == "failTelecomCall") "failed" else "ended"))
+                "disconnectTelecomCall" -> CoroutineScope(Dispatchers.Default).launch {
+                    val force = call.argument<Boolean>("force") ?: false
+                    result.success(CoreTelecomCallBridge.disconnectCall(callId, "ended", force))
+                }
+                "failTelecomCall" -> CoroutineScope(Dispatchers.Default).launch {
+                    result.success(CoreTelecomCallBridge.disconnectCall(callId, "failed", true))
                 }
                 "activateTelecomCall" -> CoroutineScope(Dispatchers.Default).launch {
                     result.success(CoreTelecomCallBridge.activateCall(callId))
                 }
+                "consumeCoreTelecomAnswer" -> result.success(
+                    CoreTelecomCallBridge.consumeAnswerRequested(
+                        appContext,
+                        callId,
+                    ),
+                )
+                "hasNativeRuntime" -> result.success(
+                    CoreTelecomCallBridge.hasNativeRuntime(callId),
+                )
+                "startActiveCallForegroundService" -> result.success(
+                    CoreTelecomForegroundService.start(
+                        appContext,
+                        callId,
+                    ),
+                )
                 "coreTelecomFlutterReady" -> {
                     CoreTelecomFlutterDispatcher.markFlutterReady(appContext, engine)
                     result.success(true)

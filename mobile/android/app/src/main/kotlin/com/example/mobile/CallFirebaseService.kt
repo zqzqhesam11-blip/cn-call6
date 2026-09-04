@@ -37,8 +37,14 @@ class CallFirebaseService : FirebaseMessagingService() {
             serviceScope.launch {
                   try {
                       markCallEnded(callId)
-                      CoreTelecomCallBridge.disconnectCall(callId, type)
-                      sendBroadcast(Intent(CNCallIncomingActivity.ACTION_TERMINAL).setPackage(packageName))
+                      val disconnectResult =
+                          CoreTelecomCallBridge.disconnectCallResult(callId, type)
+                      if (disconnectResult == CoreTelecomCallBridge.DisconnectResult.SUCCESS) {
+                          CoreTelecomCallBridge.finalizeTerminalCleanup(
+                              context = this@CallFirebaseService.applicationContext,
+                              callId = callId,
+                          )
+                      }
 
                       println(
                           "[CN CALL][FCM] " +
@@ -99,8 +105,6 @@ return
     }
 
     private fun markCallEnded(callId: String) {
-        CoreTelecomNotification.cancelForCall(this, callId)
-        CoreTelecomCallBridge.clearAnswerRequested(this, callId)
         val prefs = getSharedPreferences("FlutterSharedPreferences", MODE_PRIVATE)
         val endedIds = endedCallIds(prefs).toMutableList()
         endedIds.remove(callId)
